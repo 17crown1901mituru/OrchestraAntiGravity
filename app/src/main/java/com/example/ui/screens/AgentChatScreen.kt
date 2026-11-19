@@ -1,0 +1,456 @@
+package com.example.ui.screens
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.BookmarkAdd
+import androidx.compose.material.icons.rounded.Cloud
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
+import com.example.model.AiGenerationState
+import com.example.model.InferenceTarget
+
+@Composable
+fun AgentChatScreen(
+    aiState: AiGenerationState,
+    inferenceTarget: InferenceTarget,
+    gc2223Endpoint: String,
+    onSelectTarget: (InferenceTarget) -> Unit,
+    onSendPrompt: (String, Boolean) -> Unit,
+    onSavePlanAsBlueprint: (title: String, category: String, summary: String, content: String) -> Unit,
+    onShowMessage: (String) -> Unit
+) {
+    val clipboard = LocalClipboardManager.current
+    var promptText by rememberSaveable { mutableStateOf("") }
+    var structuredMode by rememberSaveable { mutableStateOf(true) }
+
+    val quickPrompts = remember {
+        listOf(
+            "gc2223.com に Workers AI + Gemini ルーターを組む" to "gc2223.com の Cloudflare Worker で Workers AI 無料枠を優先し、複雑タスクだけ GCP/Gemini へ逃がすルーティング設計と wrangler コマンドを作って",
+            "Termux AntiGravityAgent 拡張" to "Termux 上で antigravity コマンドを実行したとき、GitHub Actions と gc2223.com を安全に連携させる CLI フックを設計して",
+            "GCP Always Free + 予算$1ガード" to "クレジットカード登録後の GCP で課金事故をゼロにする予算アラート・Cloud Run 最小設定・Workload Identity 連携手順をまとめて",
+            "Google Dev Program 特典活用" to "Google Developer Program の特典や学習リソースを GCP / Firebase 構成のコスト最適化にどう組み合わせるか提案して"
+        )
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 760.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(
+                text = "AI オーケストレーター",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("inference_target_selector")
+            ) {
+                SegmentedButton(
+                    selected = inferenceTarget == InferenceTarget.FIREBASE_GEMINI,
+                    onClick = { onSelectTarget(InferenceTarget.FIREBASE_GEMINI) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                    icon = { Icon(Icons.Rounded.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                ) {
+                    Text("Firebase Gemini", maxLines = 1)
+                }
+                SegmentedButton(
+                    selected = inferenceTarget == InferenceTarget.GC2223_GATEWAY,
+                    onClick = { onSelectTarget(InferenceTarget.GC2223_GATEWAY) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                    icon = { Icon(Icons.Rounded.Cloud, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                ) {
+                    Text("gc2223.com GW", maxLines = 1)
+                }
+            }
+
+            if (inferenceTarget == InferenceTarget.FIREBASE_GEMINI) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    FilterChip(
+                        selected = structuredMode,
+                        onClick = { structuredMode = true },
+                        label = { Text("構造化プラン (JSON)") },
+                        modifier = Modifier.testTag("mode_structured_chip")
+                    )
+                    FilterChip(
+                        selected = !structuredMode,
+                        onClick = { structuredMode = false },
+                        label = { Text("ストリーミング相談") },
+                        modifier = Modifier.testTag("mode_stream_chip")
+                    )
+                }
+            } else {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Rounded.Terminal,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "POST $gc2223Endpoint/v1/chat へ直接送信します",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                quickPrompts.forEachIndexed { index, (label, fullPrompt) ->
+                    AssistChip(
+                        onClick = { promptText = fullPrompt },
+                        label = { Text(label) },
+                        modifier = Modifier.testTag("quick_prompt_chip_$index")
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = promptText,
+                onValueChange = { promptText = it },
+                label = { Text("構築・自動化したいワークフローを入力") },
+                placeholder = { Text("例: Termux から gc2223.com 経由で GitHub Actions を起動する設定を作って") },
+                minLines = 3,
+                maxLines = 6,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("agent_prompt_input"),
+                shape = RoundedCornerShape(16.dp)
+            )
+
+            Button(
+                onClick = { onSendPrompt(promptText, structuredMode) },
+                enabled = promptText.isNotBlank() && aiState !is AiGenerationState.Loading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("send_prompt_button"),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                if (aiState is AiGenerationState.Loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("生成中...")
+                } else {
+                    Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        if (inferenceTarget == InferenceTarget.FIREBASE_GEMINI) {
+                            "Gemini 3.8 Flash で生成"
+                        } else {
+                            "gc2223.com ゲートウェイで実行"
+                        }
+                    )
+                }
+            }
+
+            when (aiState) {
+                is AiGenerationState.Idle -> {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                        ),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "運用コストゼロ設計モード待機中",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                text = "上のプリセットを選ぶかプロンプトを入力すると、Firebase AI Logic またはデプロイ済みの gc2223.com Worker から応答を取得し、そのまま Firestore にブループリント保存できます。",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                is AiGenerationState.Loading -> Unit
+
+                is AiGenerationState.Streaming -> {
+                    ResponseCard(
+                        title = "ストリーミング応答 (Gemini 3.8 Flash)",
+                        body = aiState.text,
+                        onCopy = {
+                            clipboard.setText(AnnotatedString(aiState.text))
+                            onShowMessage("応答をコピーしました")
+                        },
+                        onSave = null
+                    )
+                }
+
+                is AiGenerationState.Success -> {
+                    val plan = aiState.structuredPlan
+                    if (plan != null) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = plan.planTitle,
+                                        style = MaterialTheme.typography.titleLarge,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.secondaryContainer,
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text(
+                                            text = "${plan.targetLayer} • ${plan.estimatedMonthlyCost}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+
+                                plan.steps.forEachIndexed { idx, step ->
+                                    Text(
+                                        text = "${idx + 1}. $step",
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                }
+
+                                Surface(
+                                    color = MaterialTheme.colorScheme.background,
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    SelectionContainer {
+                                        Text(
+                                            text = plan.cliOrConfigSnippet,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.padding(12.dp)
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            clipboard.setText(AnnotatedString(plan.cliOrConfigSnippet))
+                                            onShowMessage("スニペットをコピーしました")
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("copy_plan_snippet_button")
+                                    ) {
+                                        Icon(Icons.Rounded.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("コピー")
+                                    }
+                                    Button(
+                                        onClick = {
+                                            onSavePlanAsBlueprint(
+                                                plan.planTitle,
+                                                plan.targetLayer,
+                                                "月額目安: ${plan.estimatedMonthlyCost} / ${plan.steps.firstOrNull().orEmpty()}",
+                                                aiState.text
+                                            )
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("save_plan_blueprint_button")
+                                    ) {
+                                        Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("保存")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ResponseCard(
+                            title = if (inferenceTarget == InferenceTarget.FIREBASE_GEMINI) {
+                                "Gemini 3.8 Flash 応答"
+                            } else {
+                                "gc2223.com 応答"
+                            },
+                            body = aiState.text,
+                            onCopy = {
+                                clipboard.setText(AnnotatedString(aiState.text))
+                                onShowMessage("応答をコピーしました")
+                            },
+                            onSave = {
+                                onSavePlanAsBlueprint(
+                                    "AI 出力メモ",
+                                    "CLI",
+                                    promptText.take(120),
+                                    aiState.text
+                                )
+                            }
+                        )
+                    }
+                }
+
+                is AiGenerationState.Error -> {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = aiState.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ResponseCard(
+    title: String,
+    body: String,
+    onCopy: () -> Unit,
+    onSave: (() -> Unit)?
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        shape = RoundedCornerShape(18.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = title, style = MaterialTheme.typography.titleMedium)
+                Row {
+                    IconButton(
+                        onClick = onCopy,
+                        modifier = Modifier.testTag("copy_response_button")
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = "応答をコピー")
+                    }
+                    if (onSave != null) {
+                        IconButton(
+                            onClick = onSave,
+                            modifier = Modifier.testTag("save_response_button")
+                        ) {
+                            Icon(Icons.Rounded.BookmarkAdd, contentDescription = "ブループリント保存")
+                        }
+                    }
+                }
+            }
+            SelectionContainer {
+                Text(
+                    text = body,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+    }
+}

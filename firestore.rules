@@ -1,0 +1,284 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helper Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidNode(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.provider is string &&
+             data.provider in ['CLOUDFLARE', 'GITHUB', 'GCP', 'FIREBASE', 'TERMUX'] &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 80 &&
+             data.endpointOrTarget is string &&
+             data.endpointOrTarget.size() <= 200 &&
+             data.accountHint is string &&
+             data.accountHint.size() <= 120 &&
+             data.status is string &&
+             data.status in ['ACTIVE', 'CONFIGURED', 'ERROR', 'PAUSED'] &&
+             data.monthlyFreeQuota is string &&
+             data.monthlyFreeQuota.size() <= 80 &&
+             data.lastCheckedNote is string &&
+             data.lastCheckedNote.size() <= 300 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    function isValidBlueprint(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 100 &&
+             data.category is string &&
+             data.category in ['WORKER', 'TERMUX', 'GITHUB', 'GCP', 'CLI'] &&
+             data.summary is string &&
+             data.summary.size() <= 300 &&
+             data.content is string &&
+             data.content.size() >= 1 &&
+             data.content.size() <= 20000 &&
+             data.targetHost is string &&
+             data.targetHost.size() <= 120 &&
+             data.status is string &&
+             data.status in ['DRAFT', 'READY', 'DEPLOYED', 'ARCHIVED'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    function isValidCostConfig(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.alertEmail is string &&
+             data.alertEmail.size() >= 3 &&
+             data.alertEmail.size() <= 120 &&
+             data.dailyThresholdUsd is number &&
+             data.dailyThresholdUsd > 0 &&
+             data.dailyThresholdUsd <= 1000 &&
+             data.autoEmailEnabled is bool &&
+             data.webhookPath is string &&
+             data.webhookPath.size() <= 120 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    function isValidCostEntry(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.provider is string &&
+             data.provider in ['GCP', 'CLOUDFLARE', 'FIREBASE', 'GITHUB'] &&
+             data.dateKey is string &&
+             data.dateKey.size() == 10 &&
+             data.amountUsd is number &&
+             data.amountUsd >= 0 &&
+             data.amountUsd <= 10000 &&
+             data.usageSummary is string &&
+             data.usageSummary.size() >= 1 &&
+             data.usageSummary.size() <= 200 &&
+             data.source is string &&
+             data.source in ['AUTO_TELEMETRY', 'API_SYNC', 'MANUAL'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    function isValidCostAlert(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.dateKey is string &&
+             data.dateKey.size() == 10 &&
+             data.totalUsd is number &&
+             data.totalUsd >= 0 &&
+             data.thresholdUsd is number &&
+             data.thresholdUsd > 0 &&
+             data.recipientEmail is string &&
+             data.recipientEmail.size() >= 3 &&
+             data.recipientEmail.size() <= 120 &&
+             data.deliveryStatus is string &&
+             data.deliveryStatus in ['SENT', 'QUEUED_LOCAL', 'FAILED'] &&
+             data.deliveryDetail is string &&
+             data.deliveryDetail.size() <= 300 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    // --- User-Scoped Subcollections ---
+    match /users/{userId} {
+      match /nodes/{nodeId} {
+        allow get: if isOwner(userId) && isValidId(nodeId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(nodeId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'provider', 'title', 'endpointOrTarget',
+                           'accountHint', 'status', 'monthlyFreeQuota',
+                           'lastCheckedNote', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'provider', 'title', 'endpointOrTarget',
+                           'accountHint', 'status', 'monthlyFreeQuota',
+                           'lastCheckedNote', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().createdAt <= request.time &&
+                         isValidNode(incoming(), userId);
+
+        allow update: if isOwner(userId) &&
+                         isValidId(nodeId) &&
+                         isValidNode(incoming(), userId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().provider == existing().provider &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'title', 'endpointOrTarget', 'accountHint',
+                           'status', 'monthlyFreeQuota', 'lastCheckedNote', 'updatedAt'
+                         ]);
+
+        allow delete: if isOwner(userId) && isValidId(nodeId);
+      }
+
+      match /blueprints/{blueprintId} {
+        allow get: if isOwner(userId) && isValidId(blueprintId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(blueprintId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'title', 'category', 'summary',
+                           'content', 'targetHost', 'status', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'title', 'category', 'summary',
+                           'content', 'targetHost', 'status', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().createdAt <= request.time &&
+                         isValidBlueprint(incoming(), userId);
+
+        allow update: if isOwner(userId) &&
+                         isValidId(blueprintId) &&
+                         existing().status != 'ARCHIVED' &&
+                         isValidBlueprint(incoming(), userId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'title', 'category', 'summary', 'content',
+                           'targetHost', 'status', 'updatedAt'
+                         ]);
+
+        allow delete: if isOwner(userId) && isValidId(blueprintId);
+      }
+
+      match /cost_config/{configId} {
+        allow get: if isOwner(userId) && isValidId(configId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(configId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'alertEmail', 'dailyThresholdUsd',
+                           'autoEmailEnabled', 'webhookPath', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'alertEmail', 'dailyThresholdUsd',
+                           'autoEmailEnabled', 'webhookPath', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().createdAt <= request.time &&
+                         isValidCostConfig(incoming(), userId);
+
+        allow update: if isOwner(userId) &&
+                         isValidId(configId) &&
+                         isValidCostConfig(incoming(), userId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'alertEmail', 'dailyThresholdUsd', 'autoEmailEnabled',
+                           'webhookPath', 'updatedAt'
+                         ]);
+
+        allow delete: if isOwner(userId) && isValidId(configId);
+      }
+
+      match /cost_entries/{entryId} {
+        allow get: if isOwner(userId) && isValidId(entryId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(entryId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'provider', 'dateKey', 'amountUsd',
+                           'usageSummary', 'source', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'provider', 'dateKey', 'amountUsd',
+                           'usageSummary', 'source', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().createdAt <= request.time &&
+                         isValidCostEntry(incoming(), userId);
+
+        allow update: if isOwner(userId) &&
+                         isValidId(entryId) &&
+                         isValidCostEntry(incoming(), userId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().provider == existing().provider &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'dateKey', 'amountUsd', 'usageSummary', 'source', 'updatedAt'
+                         ]);
+
+        allow delete: if isOwner(userId) && isValidId(entryId);
+      }
+
+      match /cost_alerts/{alertId} {
+        allow get: if isOwner(userId) && isValidId(alertId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(alertId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'dateKey', 'totalUsd', 'thresholdUsd',
+                           'recipientEmail', 'deliveryStatus', 'deliveryDetail',
+                           'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'dateKey', 'totalUsd', 'thresholdUsd',
+                           'recipientEmail', 'deliveryStatus', 'deliveryDetail',
+                           'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().createdAt <= request.time &&
+                         isValidCostAlert(incoming(), userId);
+
+        allow update: if false;
+        allow delete: if isOwner(userId) && isValidId(alertId);
+      }
+    }
+  }
+}

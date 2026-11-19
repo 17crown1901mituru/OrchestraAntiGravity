@@ -1,0 +1,109 @@
+{
+  "entities": {
+    "WorkflowNode": {
+      "title": "WorkflowNode",
+      "description": "Configuration and status for a connected cloud or CLI workflow node.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "provider": { "type": "string", "enum": ["CLOUDFLARE", "GITHUB", "GCP", "FIREBASE", "TERMUX"] },
+        "title": { "type": "string" },
+        "endpointOrTarget": { "type": "string" },
+        "accountHint": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "CONFIGURED", "ERROR", "PAUSED"] },
+        "monthlyFreeQuota": { "type": "string" },
+        "lastCheckedNote": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "provider", "title", "endpointOrTarget", "accountHint", "status", "monthlyFreeQuota", "lastCheckedNote", "createdAt", "updatedAt"]
+    },
+    "AgentBlueprint": {
+      "title": "AgentBlueprint",
+      "description": "Saved LLM-generated deployment script, Worker config, GitHub workflow, or Termux CLI blueprint.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "category": { "type": "string", "enum": ["WORKER", "TERMUX", "GITHUB", "GCP", "CLI"] },
+        "summary": { "type": "string" },
+        "content": { "type": "string" },
+        "targetHost": { "type": "string" },
+        "status": { "type": "string", "enum": ["DRAFT", "READY", "DEPLOYED", "ARCHIVED"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "category", "summary", "content", "targetHost", "status", "createdAt", "updatedAt"]
+    },
+    "CostConfig": {
+      "title": "CostConfig",
+      "description": "User daily cost threshold ($0.10/day default) and alert email settings.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "alertEmail": { "type": "string" },
+        "dailyThresholdUsd": { "type": "number" },
+        "autoEmailEnabled": { "type": "boolean" },
+        "webhookPath": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "alertEmail", "dailyThresholdUsd", "autoEmailEnabled", "webhookPath", "createdAt", "updatedAt"]
+    },
+    "CostEntry": {
+      "title": "CostEntry",
+      "description": "Daily expense or usage telemetry item across GCP, Cloudflare, Firebase, and GitHub.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "provider": { "type": "string", "enum": ["GCP", "CLOUDFLARE", "FIREBASE", "GITHUB"] },
+        "dateKey": { "type": "string" },
+        "amountUsd": { "type": "number" },
+        "usageSummary": { "type": "string" },
+        "source": { "type": "string", "enum": ["AUTO_TELEMETRY", "API_SYNC", "MANUAL"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "provider", "dateKey", "amountUsd", "usageSummary", "source", "createdAt", "updatedAt"]
+    },
+    "CostAlert": {
+      "title": "CostAlert",
+      "description": "Audit log of triggered daily threshold email alerts.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "dateKey": { "type": "string" },
+        "totalUsd": { "type": "number" },
+        "thresholdUsd": { "type": "number" },
+        "recipientEmail": { "type": "string" },
+        "deliveryStatus": { "type": "string", "enum": ["SENT", "QUEUED_LOCAL", "FAILED"] },
+        "deliveryDetail": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "dateKey", "totalUsd", "thresholdUsd", "recipientEmail", "deliveryStatus", "deliveryDetail", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/nodes/{nodeId}": {
+      "schema": { "$ref": "#/entities/WorkflowNode" },
+      "description": "User-scoped multi-cloud and Termux workflow node configurations."
+    },
+    "/users/{userId}/blueprints/{blueprintId}": {
+      "schema": { "$ref": "#/entities/AgentBlueprint" },
+      "description": "User-scoped AI-generated deployment blueprints and CLI scripts."
+    },
+    "/users/{userId}/cost_config/{configId}": {
+      "schema": { "$ref": "#/entities/CostConfig" },
+      "description": "User-scoped daily cost threshold and alert email settings."
+    },
+    "/users/{userId}/cost_entries/{entryId}": {
+      "schema": { "$ref": "#/entities/CostEntry" },
+      "description": "User-scoped multi-cloud daily spend and telemetry entries."
+    },
+    "/users/{userId}/cost_alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/CostAlert" },
+      "description": "User-scoped threshold alert logs."
+    }
+  }
+}

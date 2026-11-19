@@ -1,0 +1,6 @@
+{
+  "name": "AntiGravity Hub",
+  "description": "Zero-cost LLM workflow orchestrator connecting Firebase, Cloudflare (gc2223.com), GitHub, GCP, and Termux AntiGravityAgent CLI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
