@@ -106,6 +106,21 @@ enum class InferenceTarget {
     GC2223_GATEWAY
 }
 
+enum class SourceAttachmentKind {
+    MARKDOWN,
+    PDF,
+    IMAGE,
+    VIDEO
+}
+
+data class AttachedSource(
+    val uriString: String,
+    val displayName: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+    val kind: SourceAttachmentKind
+)
+
 data class ExternalCredentials(
     val gc2223Endpoint: String = "https://gc2223.com",
     val gc2223BearerToken: String = "",

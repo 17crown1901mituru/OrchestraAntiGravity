@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -20,11 +24,18 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BookmarkAdd
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.PermMedia
+import androidx.compose.material.icons.rounded.PictureAsPdf
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.VideoFile
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -52,15 +63,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.AiGenerationState
+import com.example.model.AttachedSource
 import com.example.model.InferenceTarget
+import com.example.model.SourceAttachmentKind
+import java.util.Locale
 
 @Composable
 fun AgentChatScreen(
     aiState: AiGenerationState,
     inferenceTarget: InferenceTarget,
     gc2223Endpoint: String,
+    attachedSources: List<AttachedSource>,
+    onAddSourceUris: (List<Uri>) -> Unit,
+    onRemoveSource: (String) -> Unit,
     onSelectTarget: (InferenceTarget) -> Unit,
     onSendPrompt: (String, Boolean) -> Unit,
     onSavePlanAsBlueprint: (title: String, category: String, summary: String, content: String) -> Unit,
@@ -70,13 +88,34 @@ fun AgentChatScreen(
     var promptText by rememberSaveable { mutableStateOf("") }
     var structuredMode by rememberSaveable { mutableStateOf(true) }
 
+    val mediaPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(5)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            onAddSourceUris(uris)
+        }
+    }
+
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            onAddSourceUris(uris)
+        }
+    }
+
     val quickPrompts = remember {
         listOf(
+            "添付ソースから最適設計を組む" to "添付した Markdown / PDF / 画像 / 動画の仕様や画面構成を統合理解し、運用コストゼロを目指した具体的なアーキテクチャと実装手順・CLI スクリプトを組み立てて",
             "gc2223.com に Workers AI + Gemini ルーターを組む" to "gc2223.com の Cloudflare Worker で Workers AI 無料枠を優先し、複雑タスクだけ GCP/Gemini へ逃がすルーティング設計と wrangler コマンドを作って",
             "Termux AntiGravityAgent 拡張" to "Termux 上で antigravity コマンドを実行したとき、GitHub Actions と gc2223.com を安全に連携させる CLI フックを設計して",
             "GCP Always Free + 予算$1ガード" to "クレジットカード登録後の GCP で課金事故をゼロにする予算アラート・Cloud Run 最小設定・Workload Identity 連携手順をまとめて",
             "Google Dev Program 特典活用" to "Google Developer Program の特典や学習リソースを GCP / Firebase 構成のコスト最適化にどう組み合わせるか提案して"
         )
+    }
+
+    val totalAttachedBytes = remember(attachedSources) {
+        attachedSources.sumOf { it.sizeBytes }
     }
 
     Box(
@@ -158,10 +197,143 @@ fun AgentChatScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "POST $gc2223Endpoint/v1/chat へ直接送信します",
+                            text = "POST $gc2223Endpoint/v1/chat へ送信（PDF/画像/動画解析時は Firebase Gemini を選択）",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+                }
+            }
+
+            // Multimodal Source Attachment Section (Markdown, PDF, Image, Video)
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "関連ソース添付 (Markdown / PDF / 画像 / 動画)",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        if (attachedSources.isNotEmpty()) {
+                            Text(
+                                text = "${attachedSources.size}件 • ${formatBytes(totalAttachedBytes)} / 20MB",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                documentPickerLauncher.launch(
+                                    arrayOf(
+                                        "application/pdf",
+                                        "text/markdown",
+                                        "text/plain",
+                                        "application/json",
+                                        "text/*"
+                                    )
+                                )
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("attach_docs_button")
+                        ) {
+                            Icon(Icons.Rounded.AttachFile, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("MD / PDF 添付", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                mediaPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                )
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("attach_media_button")
+                        ) {
+                            Icon(Icons.Rounded.PermMedia, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("画像 / 動画 添付", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+
+                    if (attachedSources.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            attachedSources.forEach { src ->
+                                val icon = when (src.kind) {
+                                    SourceAttachmentKind.MARKDOWN -> Icons.Rounded.Description
+                                    SourceAttachmentKind.PDF -> Icons.Rounded.PictureAsPdf
+                                    SourceAttachmentKind.IMAGE -> Icons.Rounded.Image
+                                    SourceAttachmentKind.VIDEO -> Icons.Rounded.VideoFile
+                                }
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surface,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(start = 10.dp, end = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = src.kind.name,
+                                            tint = MaterialTheme.colorScheme.secondary,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = src.displayName,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = "${src.kind.name} • ${formatBytes(src.sizeBytes)}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = { onRemoveSource(src.uriString) },
+                                            modifier = Modifier.testTag("remove_source_${src.displayName}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Close,
+                                                contentDescription = "${src.displayName} を削除",
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -185,7 +357,7 @@ fun AgentChatScreen(
                 value = promptText,
                 onValueChange = { promptText = it },
                 label = { Text("構築・自動化したいワークフローを入力") },
-                placeholder = { Text("例: Termux から gc2223.com 経由で GitHub Actions を起動する設定を作って") },
+                placeholder = { Text("例: 添付した仕様書と画面スクショをもとに構築プランを作成して") },
                 minLines = 3,
                 maxLines = 6,
                 modifier = Modifier
@@ -196,7 +368,7 @@ fun AgentChatScreen(
 
             Button(
                 onClick = { onSendPrompt(promptText, structuredMode) },
-                enabled = promptText.isNotBlank() && aiState !is AiGenerationState.Loading,
+                enabled = (promptText.isNotBlank() || attachedSources.isNotEmpty()) && aiState !is AiGenerationState.Loading,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp)
@@ -216,7 +388,11 @@ fun AgentChatScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         if (inferenceTarget == InferenceTarget.FIREBASE_GEMINI) {
-                            "Gemini 3.8 Flash で生成"
+                            if (attachedSources.isNotEmpty()) {
+                                "Gemini でソース解析して生成 (${attachedSources.size}件)"
+                            } else {
+                                "Gemini 3.8 Flash で生成"
+                            }
                         } else {
                             "gc2223.com ゲートウェイで実行"
                         }
@@ -453,4 +629,14 @@ private fun ResponseCard(
             }
         }
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes <= 0L) return "0 KB"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) {
+        return String.format(Locale.US, "%.1f KB", kb)
+    }
+    val mb = kb / 1024.0
+    return String.format(Locale.US, "%.1f MB", mb)
 }

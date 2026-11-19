@@ -1,12 +1,14 @@
 package com.example
 
 import android.content.Context
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.workDataOf
 import com.example.data.GitHubActivityService
 import com.example.data.LocalSecretsStore
+import com.example.data.MultimodalSourceLoader
 import com.example.data.SyncSnapshotStore
 import com.example.model.BackgroundSyncSettings
 import com.example.model.CloudflareSyncStatus
@@ -16,11 +18,14 @@ import com.example.model.GitHubActivityEvent
 import com.example.model.GitHubCommitSummary
 import com.example.model.GitHubRepoSummary
 import com.example.model.GitHubSyncStatus
+import com.example.model.SourceAttachmentKind
 import com.example.model.SyncHealthState
 import com.example.model.SyncStatusSnapshot
 import com.example.model.TermuxAgentSyncStatus
 import com.example.sync.CloudStatusSyncWorker
 import com.example.sync.TermuxAgentSyncWorker
+import com.google.firebase.ai.type.InlineDataPart
+import com.google.firebase.ai.type.TextPart
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -349,6 +354,57 @@ class ExampleRobolectricTest {
     } finally {
       runCatching { ss.close() }
       runCatching { serverThread.join(1000) }
+    }
+  }
+
+  @Test
+  fun `multimodal source loader inspects markdown pdf video and builds inline content`() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val loader = MultimodalSourceLoader(context)
+
+    val tempDir = context.cacheDir
+    val mdFile = java.io.File(tempDir, "architecture.md").apply {
+      writeText("# Architecture\nUse Cloudflare Workers + Termux CLI.")
+    }
+    val pdfFile = java.io.File(tempDir, "spec.pdf").apply {
+      writeBytes("%PDF-1.4\n1 0 obj\n<<>>\nendobj\n".toByteArray())
+    }
+    val mp4File = java.io.File(tempDir, "demo.mp4").apply {
+      writeBytes(byteArrayOf(0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70))
+    }
+
+    try {
+      val mdSource = loader.inspectUri(Uri.fromFile(mdFile))!!
+      val pdfSource = loader.inspectUri(Uri.fromFile(pdfFile))!!
+      val videoSource = loader.inspectUri(Uri.fromFile(mp4File))!!
+
+      assertEquals(SourceAttachmentKind.MARKDOWN, mdSource.kind)
+      assertEquals(SourceAttachmentKind.PDF, pdfSource.kind)
+      assertEquals("application/pdf", pdfSource.mimeType)
+      assertEquals(SourceAttachmentKind.VIDEO, videoSource.kind)
+
+      val contentResult = loader.buildMultimodalContent(
+        instructionPrompt = "Assemble solution",
+        sources = listOf(mdSource, pdfSource, videoSource)
+      )
+      assertTrue(contentResult.isSuccess)
+      val parts = contentResult.getOrThrow().parts
+      val textParts = parts.filterIsInstance<TextPart>()
+      val inlineParts = parts.filterIsInstance<InlineDataPart>()
+
+      assertTrue(textParts.any { it.text.contains("Use Cloudflare Workers + Termux CLI.") })
+      assertTrue(textParts.any { it.text == "Assemble solution" })
+      assertEquals(2, inlineParts.size)
+      assertEquals("application/pdf", inlineParts[0].mimeType)
+      assertEquals("video/mp4", inlineParts[1].mimeType)
+
+      val oversized = pdfSource.copy(sizeBytes = MultimodalSourceLoader.MAX_TOTAL_INLINE_BYTES + 1024L)
+      val rejectResult = loader.buildMultimodalContent("Check size", listOf(oversized))
+      assertTrue(rejectResult.isFailure)
+    } finally {
+      mdFile.delete()
+      pdfFile.delete()
+      mp4File.delete()
     }
   }
 }

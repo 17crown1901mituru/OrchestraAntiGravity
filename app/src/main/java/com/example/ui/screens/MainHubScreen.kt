@@ -112,6 +112,7 @@ fun MainHubScreen(
     val costAlertsState by viewModel.costAlertsState.collectAsStateWithLifecycle()
     val aiState by viewModel.aiState.collectAsStateWithLifecycle()
     val inferenceTarget by viewModel.inferenceTarget.collectAsStateWithLifecycle()
+    val attachedSources by viewModel.attachedSources.collectAsStateWithLifecycle()
     val credentials by viewModel.credentials.collectAsStateWithLifecycle()
     val vaultMetadata by viewModel.vaultMetadata.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
@@ -293,6 +294,9 @@ fun MainHubScreen(
                             aiState = aiState,
                             inferenceTarget = inferenceTarget,
                             gc2223Endpoint = credentials.gc2223Endpoint,
+                            attachedSources = attachedSources,
+                            onAddSourceUris = viewModel::addAttachedUris,
+                            onRemoveSource = viewModel::removeAttachedSource,
                             onSelectTarget = viewModel::setInferenceTarget,
                             onSendPrompt = viewModel::runPrompt,
                             onSavePlanAsBlueprint = { title, cat, summary, content ->

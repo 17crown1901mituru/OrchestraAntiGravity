@@ -1,15 +1,18 @@
 package com.example.ui.viewmodel
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
+import com.example.data.MultimodalSourceLoader
 import com.example.data.SyncSnapshotStore
 import com.example.model.AgentBlueprint
 import com.example.model.AiGenerationState
+import com.example.model.AttachedSource
 import com.example.model.BackgroundSyncSettings
 import com.example.model.CostAlert
 import com.example.model.CostConfig
@@ -157,6 +160,11 @@ class HubViewModel(
     private val _inferenceTarget = MutableStateFlow(InferenceTarget.FIREBASE_GEMINI)
     val inferenceTarget: StateFlow<InferenceTarget> = _inferenceTarget.asStateFlow()
 
+    private val _attachedSources = MutableStateFlow<List<AttachedSource>>(emptyList())
+    val attachedSources: StateFlow<List<AttachedSource>> = _attachedSources.asStateFlow()
+
+    private val sourceLoader by lazy { MultimodalSourceLoader(applicationContext) }
+
     private val _credentials = MutableStateFlow(secretsStore.loadForUser(currentUserId))
     val credentials: StateFlow<ExternalCredentials> = _credentials.asStateFlow()
 
@@ -250,6 +258,36 @@ class HubViewModel(
 
     fun setInferenceTarget(target: InferenceTarget) {
         _inferenceTarget.value = target
+    }
+
+    fun addAttachedUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val existing = _attachedSources.value.associateBy { it.uriString }.toMutableMap()
+        var addedCount = 0
+        var skippedCount = 0
+        uris.forEach { uri ->
+            val inspected = sourceLoader.inspectUri(uri)
+            if (inspected != null) {
+                existing[inspected.uriString] = inspected
+                addedCount++
+            } else {
+                skippedCount++
+            }
+        }
+        _attachedSources.value = existing.values.toList()
+        if (addedCount > 0) {
+            _statusBanner.value = "${addedCount}件の関連ソースを添付しました"
+        } else if (skippedCount > 0) {
+            _statusBanner.value = "未対応のファイル形式がスキップされました"
+        }
+    }
+
+    fun removeAttachedSource(uriString: String) {
+        _attachedSources.value = _attachedSources.value.filterNot { it.uriString == uriString }
+    }
+
+    fun clearAttachedSources() {
+        _attachedSources.value = emptyList()
     }
 
     fun clearBanner() {
@@ -400,47 +438,70 @@ class HubViewModel(
 
     fun runPrompt(userPrompt: String, structuredPlanMode: Boolean) {
         val cleanPrompt = userPrompt.trim()
-        if (cleanPrompt.isEmpty()) return
+        val sources = _attachedSources.value
+        if (cleanPrompt.isEmpty() && sources.isEmpty()) return
+        val effectivePrompt = cleanPrompt.ifEmpty {
+            "添付した関連ソース（Markdown / PDF / 画像 / 動画）の内容を統合的に解析し、運用コストゼロを目指した具体的なソリューションと構築手順を組み立ててください。"
+        }
 
         if (_inferenceTarget.value == InferenceTarget.GC2223_GATEWAY) {
-            queryGc2223Gateway(cleanPrompt)
+            queryGc2223Gateway(effectivePrompt, sources)
             return
         }
 
         if (structuredPlanMode) {
-            generateStructuredPlan(cleanPrompt)
+            generateStructuredPlan(effectivePrompt, sources)
         } else {
-            generateStreamingReply(cleanPrompt)
+            generateStreamingReply(effectivePrompt, sources)
         }
     }
 
-    private fun generateStreamingReply(userPrompt: String) {
+    private fun generateStreamingReply(userPrompt: String, sources: List<AttachedSource>) {
         viewModelScope.launch {
             _aiState.value = AiGenerationState.Loading
             val accumulated = StringBuilder()
             val contextualPrompt = buildString {
                 appendLine("You are AntiGravityAgent Architect, helping the user ($userEmail) build a near-zero-cost LLM workflow.")
                 appendLine("Stack: Firebase (Auth/Firestore/AI Logic), Cloudflare Workers on domain gc2223.com (${_credentials.value.gc2223Endpoint}), GitHub Actions, GCP Always-Free + $0.10/day Budget Alert, and Termux AntiGravityAgent CLI.")
+                if (sources.isNotEmpty()) {
+                    appendLine("Carefully inspect ALL attached multimodal sources (Markdown specs, PDFs, images, videos) and synthesize a unified, actionable solution.")
+                }
                 appendLine("Respond concisely in Japanese with practical commands or configs.")
                 appendLine()
                 append("User request: ")
                 append(userPrompt)
             }
             try {
-                withTimeout(60_000L) {
-                    chatModel.generateContentStream(contextualPrompt).collect { chunk ->
-                        val part = chunk.text.orEmpty()
-                        accumulated.append(part)
-                        _aiState.value = AiGenerationState.Streaming(accumulated.toString())
+                if (sources.isEmpty()) {
+                    withTimeout(60_000L) {
+                        chatModel.generateContentStream(contextualPrompt).collect { chunk ->
+                            val part = chunk.text.orEmpty()
+                            accumulated.append(part)
+                            _aiState.value = AiGenerationState.Streaming(accumulated.toString())
+                        }
+                    }
+                } else {
+                    val contentResult = sourceLoader.buildMultimodalContent(contextualPrompt, sources)
+                    val multimodalContent = contentResult.getOrElse { err ->
+                        _aiState.value = AiGenerationState.Error(err.localizedMessage ?: "添付ソースの読み込みに失敗しました。")
+                        return@launch
+                    }
+                    withTimeout(60_000L) {
+                        chatModel.generateContentStream(multimodalContent).collect { chunk ->
+                            val part = chunk.text.orEmpty()
+                            accumulated.append(part)
+                            _aiState.value = AiGenerationState.Streaming(accumulated.toString())
+                        }
                     }
                 }
                 if (accumulated.isNotBlank()) {
                     _aiState.value = AiGenerationState.Success(accumulated.toString())
+                    val srcLabel = if (sources.isNotEmpty()) " + ${sources.size} sources" else ""
                     repository.addCostEntry(
                         userId = currentUserId,
                         provider = "FIREBASE",
                         amountUsd = 0.0,
-                        usageSummary = "Gemini 3.8 Flash stream (${accumulated.length} chars, Spark Free)",
+                        usageSummary = "Gemini 3.8 Flash stream$srcLabel (${accumulated.length} chars, Spark Free)",
                         source = "AUTO_TELEMETRY"
                     )
                 } else {
@@ -448,7 +509,7 @@ class HubViewModel(
                 }
             } catch (e: TimeoutCancellationException) {
                 Log.e(TAG, "Streaming timed out", e)
-                _aiState.value = AiGenerationState.Error("60秒でタイムアウトしました。再度お試しください。")
+                _aiState.value = AiGenerationState.Error("60秒でタイムアウトしました。メディアサイズを小さくして再度お試しください。")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -458,24 +519,38 @@ class HubViewModel(
         }
     }
 
-    private fun generateStructuredPlan(userPrompt: String) {
+    private fun generateStructuredPlan(userPrompt: String, sources: List<AttachedSource>) {
         viewModelScope.launch {
             _aiState.value = AiGenerationState.Loading
             val prompt = buildString {
-                appendLine("Design a concrete zero-cost automation plan for:")
+                appendLine("Design a concrete zero-cost automation solution for:")
                 appendLine("Account: $userEmail")
                 appendLine("Cloudflare domain: ${_credentials.value.gc2223Endpoint}")
-                appendLine("GitHub repo: ${_credentials.value.githubOwnerRepo.ifBlank { "owner/antigravity-agent" }}")
+                appendLine("GitHub repo: ${_credentials.value.githubOwnerRepo.ifBlank { "17crown1901mituru/OrchestraAntiGravity" }}")
                 appendLine("GCP project: ${_credentials.value.gcpProjectId.ifBlank { "gen-lang-client-0439741065" }}")
                 appendLine("Target CLI: Termux AntiGravityAgent")
+                if (sources.isNotEmpty()) {
+                    appendLine("Synthesize the attached Markdown, PDF, image, and/or video sources into the steps and cliOrConfigSnippet.")
+                }
                 appendLine("Respond in Japanese for descriptions and steps, with a valid copy-pasteable snippet in cliOrConfigSnippet.")
                 appendLine()
                 append("Request: ")
                 append(userPrompt)
             }
             try {
-                val response = withTimeout(60_000L) {
-                    plannerModel.generateContent(prompt)
+                val response = if (sources.isEmpty()) {
+                    withTimeout(60_000L) {
+                        plannerModel.generateContent(prompt)
+                    }
+                } else {
+                    val contentResult = sourceLoader.buildMultimodalContent(prompt, sources)
+                    val multimodalContent = contentResult.getOrElse { err ->
+                        _aiState.value = AiGenerationState.Error(err.localizedMessage ?: "添付ソースの読み込みに失敗しました。")
+                        return@launch
+                    }
+                    withTimeout(60_000L) {
+                        plannerModel.generateContent(multimodalContent)
+                    }
                 }
                 val rawJson = response.text
                     ?: throw IllegalStateException("Empty structured response.")
@@ -502,11 +577,12 @@ class HubViewModel(
                     append("```")
                 }
                 _aiState.value = AiGenerationState.Success(formatted, structuredPlan = plan)
+                val srcLabel = if (sources.isNotEmpty()) " (${sources.size} sources)" else ""
                 repository.addCostEntry(
                     userId = currentUserId,
                     provider = "FIREBASE",
                     amountUsd = 0.0,
-                    usageSummary = "Gemini 3.8 Flash JSON plan: ${plan.planTitle.take(60)}",
+                    usageSummary = "Gemini 3.8 Flash JSON plan$srcLabel: ${plan.planTitle.take(50)}",
                     source = "AUTO_TELEMETRY"
                 )
             } catch (e: TimeoutCancellationException) {
@@ -521,15 +597,31 @@ class HubViewModel(
         }
     }
 
-    private fun queryGc2223Gateway(userPrompt: String) {
+    private fun queryGc2223Gateway(userPrompt: String, sources: List<AttachedSource>) {
         viewModelScope.launch {
             _aiState.value = AiGenerationState.Loading
+            val (textContext, skippedBinaries) = if (sources.isNotEmpty()) {
+                sourceLoader.extractTextContextForGateway(sources)
+            } else {
+                "" to emptyList()
+            }
+            if (skippedBinaries.isNotEmpty()) {
+                _aiState.value = AiGenerationState.Error(
+                    "PDF / 画像 / 動画 (${skippedBinaries.joinToString(", ")}) の解析には「Firebase Gemini」を選択してください。"
+                )
+                return@launch
+            }
+            val combinedPrompt = if (textContext.isNotBlank()) {
+                "$textContext\n\n---\n$userPrompt"
+            } else {
+                userPrompt
+            }
             val creds = _credentials.value
             val idToken = fetchFirebaseIdToken()
             val result = bridgeClient.queryGc2223Gateway(
                 baseUrl = creds.gc2223Endpoint,
                 bearerToken = creds.gc2223BearerToken,
-                prompt = userPrompt,
+                prompt = combinedPrompt,
                 firebaseIdToken = idToken
             )
             if (result.success) {
