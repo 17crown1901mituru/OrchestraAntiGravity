@@ -11,8 +11,9 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
    - 起動時に Firebase App Check（デバッグビルドは Debug プロバイダ、リリースは Play/reCAPTCHA プロバイダ）を初期化。
    - Firestore Security Rules（`firestore.rules`）により、認証済みユーザー本人のドキュメント（`/users/{userId}/...`）のみ読み書き可能。
 
-2. **マルチターゲット・マルチモーダル LLM エージェント (`AgentChatScreen`, `MultimodalSourceLoader`, `HubViewModel`)**
-   - **Firebase AI Logic (`gemini-3.8-flash`)**: Markdown / テキスト、PDF、画像、動画（合計 20MB 未満のインラインメディア、Android Photo Picker / SAF 経由のパーミッションレス選択）を統合解析し、ストリーミング相談または JSON Schema 指定の構造化ソリューション・手順・CLI スニペットを生成。
+2. **マルチターゲット・マルチモーダル LLM エージェント (`AgentChatScreen`, `WebContextCrawler`, `MultimodalSourceLoader`, `HubViewModel`)**
+   - **URL・ドメイン指定クロール & 最新デバイス画面取得**: `google.com` 等のドメインまたは URL を入力し、単一 URL／ドメイン巡回（`sitemap.xml` ＆同一オリジンリンク探索）を実行して Markdown ソース化。さらに Pixel 9 Pro / Galaxy S25 Ultra / iPhone 16 Pro / Foldable 展開等の最新デバイスプロファイル（User-Agent・解像度比率）で Web 画面を描画・PNG キャプチャし、そのまま Gemini 解析へ添付可能（`gc2223.com/v1/screenshot` Browser Rendering にも対応）。
+   - **Firebase AI Logic (`gemini-3.8-flash`)**: Markdown / テキスト、PDF、画像、動画、およびクロール・キャプチャした画面を統合解析し、ストリーミング相談または JSON Schema 指定の構造化ソリューション・手順・CLI スニペットを生成。
    - **Cloudflare Workers Gateway (`gc2223.com/v1/chat`)**: Firebase ID Token（`X-Firebase-Token`）および Bearer Token によるシームレス認証付きゲートウェイ推論（添付 Markdown / テキストのコンテキスト注入対応）。
    - 生成された設計や CLI スクリプトはそのまま Firestore のブループリント保管庫へ保存可能。
 
@@ -28,20 +29,14 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
      - Termux ローカル Daemon URL（デフォルト `http://127.0.0.1:8787`）/ ローカル Bearer Token
    - 設定画面から GitHub PAT・Cloudflare Token・Gateway `/health`・Termux `/status` の疎通確認を実行可能。
 
-5. **GitHub アクティビティサマリー & WorkManager バックグラウンド同期 (`sync/`, `GitHubActivityService`, `StatusDashboardScreen`)**
-   - **`GitHubActivityService`**: GitHub REST API から認証ユーザー、最近更新されたリポジトリ、対象リポジトリのメタデータ（ブランチ・Open PR 数・Open Issue 数・Star 数）、直近コミット一覧、最新 Actions 実行結果、アクティビティイベント（Push / PR / Issue / Release 等）を取得。
-   - **`CloudStatusSyncWorker`**: 暗号化ボルトの認証情報を使い、GitHub と Cloudflare（API Token 状態・デプロイ済み Workers・Gateway `/health` レイテンシ）をバックグラウンド同期（`NetworkType.CONNECTED` 制約付き）。
-   - **`TermuxAgentSyncWorker`**: 端末内の Termux `AntiGravityAgent` CLI ローカル HTTP デーモン（`http://127.0.0.1:8787/status`、404 時は `/health` にフォールバック）をポーリングし、デーモン状態・PID・稼働時間・実行中タスク・最新コマンド・終了コード・本日リクエスト数を取得（ローカルループバック通信のため外部ネット接続制約なしで動作）。
-   - **`SyncSnapshotStore`**: クラウド同期結果（`cloud_snapshot_$uid`）と Termux 同期結果（`termux_snapshot_$uid`）を別キーで永続化し、並列実行時の上書き競合を防止。
-   - **`BackgroundSyncScheduler`**: 15 分 / 30 分 / 1 時間 / 6 時間間隔での定期同期および即時手動同期を制御。
+5. **GitHub アクティビティ・WorkManager 同期 & Email Worker 自己修復 (`sync/`, `SelfHealDialog`)**
+   - **`GitHubActivityService`**: GitHub REST API から認証ユーザー、最近更新されたリポジトリ、対象リポジトリのメタデータ、直近コミット一覧、最新 Actions 実行結果（Run ID 含む）、アクティビティイベントを取得。
+   - **Email Worker 宛先別ルーティング & 自律ハードニング (`worker/src/worker.js`)**: `ci-heal@`（エラー診断＆再実行）、`tf@`（Terraform `plan`/`apply` 起動）、`crawl@`（URL 調査＆返信）、`task@`（Workers AI によるタスク分類・実行）を統合処理。30分 TTL ワンタイム承認（`APPROVE APPLY: <id>` / `APPROVE RERUN: <id>`）、メールスレッド文脈記憶（`In-Reply-To` / `References`）、CI 修復ナレッジベース、時間別レート制限＆`SAFE_MODE` サーキットブレーカー、6時間毎 Cron CI 監視＋`GITHUB_PAT` 期限アラートを搭載。
+   - **`CloudStatusSyncWorker` / `TermuxAgentSyncWorker` / `POST /run` & Pull キュー耐障害機構**: Termux `antigravity pull-task` はバッテリー残量・充電・ネットワーク状態（`X-Device-Battery` / `X-Device-Charging` / `X-Device-Network`）を送信し、10分リース・最大3回リトライ後の DLQ 退避（`dlq:`）・`/v1/termux/ack` 時の R2 ログ退避に対応。
 
-6. **ゼロコスト構築デプロイキット (`DeployKitScreen`, `StackTemplates`)**
-   - コピー・保存可能な構築テンプレートを内蔵：
-     - Cloudflare Worker ゲートウェイ（SSO 検証 + Workers AI + `/v1/cost-alert` + `/v1/dispatch-github` + `/install.sh`）
-     - `wrangler.toml` ルーティング設定
-     - Termux `AntiGravityAgent` CLI + `~/.config/antigravity/state.json` 状態記録 + `antigravity serve` ローカル `/status` HTTP デーモン
-     - GitHub Actions 自動デプロイワークフロー
-     - GCP Always Free & `$3/月（$0.10/日相当）` 予算アラート設定コマンド
+6. **Terraform & 全体オーケストレーション自動化キット (`DeployKitScreen`, `OrchestrationHardeningPanel`, `OrchestrationTemplates`)**
+   - **Terraform IaC (`infra/main.tf`)**: GCP Cloud Run LLM 実行基盤・`$3/月` 予算アラート＋**Pub/Sub 実遮断フック**（`google_pubsub_topic.budget_alerts` -> `/v1/gcp-budget-hook` で `SAFE_MODE` 自動起動）・Cloudflare R2（監査 JSONL / Termux ログ / CI ナレッジ / tfstate）に加え、Cloudflare KV (`orchestration_kv`) と Email Routing ルールを一括管理。
+   - **アプリ側ハードニング・承認・監査パネル (`OrchestrationHardeningPanel`)**: `trace_id` 一貫追跡（App -> Worker -> GitHub Actions -> Termux -> R2 監査タイムライン / Firestore テレメトリ）、ワンタップ承認／却下（`/v1/approvals/decide`）、`SAFE_MODE` 緊急遮断・解除トグル（`/v1/circuit-breaker`）、Termux Heartbeat・DLQ・Cron 監視状況をアプリ内からリアルタイム操作可能。
 
 ---
 

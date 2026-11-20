@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.Code
@@ -54,6 +55,7 @@ fun NodesScreen(
     onVerifyCloudflare: (WorkflowNode) -> Unit,
     onVerifyGitHub: (WorkflowNode) -> Unit,
     onDispatchGitHub: (WorkflowNode) -> Unit,
+    onOpenSelfHeal: () -> Unit = {},
     onMarkNodeActive: (WorkflowNode, String, String) -> Unit
 ) {
 
@@ -132,6 +134,7 @@ fun NodesScreen(
                                 onVerifyCloudflare = { onVerifyCloudflare(node) },
                                 onVerifyGitHub = { onVerifyGitHub(node) },
                                 onDispatchGitHub = { onDispatchGitHub(node) },
+                                onOpenSelfHeal = onOpenSelfHeal,
                                 onToggleStatus = { status, note ->
                                     onMarkNodeActive(node, status, note)
                                 }
@@ -152,6 +155,7 @@ private fun WorkflowNodeCard(
     onVerifyCloudflare: () -> Unit,
     onVerifyGitHub: () -> Unit,
     onDispatchGitHub: () -> Unit,
+    onOpenSelfHeal: () -> Unit,
     onToggleStatus: (String, String) -> Unit
 ) {
     val icon = when (node.provider) {
@@ -265,7 +269,7 @@ private fun WorkflowNodeCard(
                                 .weight(1f)
                                 .testTag("verify_github_button")
                         ) {
-                            Text("PAT確認")
+                            Text("PAT確認", maxLines = 1)
                         }
                         Button(
                             onClick = onDispatchGitHub,
@@ -275,7 +279,17 @@ private fun WorkflowNodeCard(
                         ) {
                             Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Actions起動")
+                            Text("Actions", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = onOpenSelfHeal,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("node_self_heal_button")
+                        ) {
+                            Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("修復", maxLines = 1)
                         }
                     }
 

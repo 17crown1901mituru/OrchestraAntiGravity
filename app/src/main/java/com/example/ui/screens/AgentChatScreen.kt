@@ -1,10 +1,13 @@
 package com.example.ui.screens
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -32,7 +35,9 @@ import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.PermMedia
+import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PictureAsPdf
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.VideoFile
@@ -60,15 +65,23 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.AiGenerationState
 import com.example.model.AttachedSource
+import com.example.model.CrawlMode
+import com.example.model.DeviceViewportProfile
 import com.example.model.InferenceTarget
 import com.example.model.SourceAttachmentKind
+import com.example.model.WebCrawlPreview
+import com.example.ui.components.DeviceCaptureDialog
 import java.util.Locale
 
 @Composable
@@ -77,6 +90,10 @@ fun AgentChatScreen(
     inferenceTarget: InferenceTarget,
     gc2223Endpoint: String,
     attachedSources: List<AttachedSource>,
+    isCrawlingWeb: Boolean,
+    lastCrawlPreview: WebCrawlPreview?,
+    onCrawlUrlOrDomain: (String, CrawlMode, DeviceViewportProfile) -> Unit,
+    onAttachDeviceScreenshot: (Bitmap, String, DeviceViewportProfile) -> Unit,
     onAddSourceUris: (List<Uri>) -> Unit,
     onRemoveSource: (String) -> Unit,
     onSelectTarget: (InferenceTarget) -> Unit,
@@ -84,9 +101,14 @@ fun AgentChatScreen(
     onSavePlanAsBlueprint: (title: String, category: String, summary: String, content: String) -> Unit,
     onShowMessage: (String) -> Unit
 ) {
+    val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var promptText by rememberSaveable { mutableStateOf("") }
     var structuredMode by rememberSaveable { mutableStateOf(true) }
+    var urlInput by rememberSaveable { mutableStateOf("") }
+    var crawlMode by rememberSaveable { mutableStateOf(CrawlMode.DOMAIN_CRAWL) }
+    var deviceProfile by rememberSaveable { mutableStateOf(DeviceViewportProfile.PIXEL_9_PRO) }
+    var showDeviceCaptureDialog by rememberSaveable { mutableStateOf(false) }
 
     val mediaPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(5)
@@ -205,6 +227,141 @@ fun AgentChatScreen(
                 }
             }
 
+            // URL / Domain Crawl & Latest Device Screen Capture Card
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Language,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = "URL・ドメインクロール & 最新デバイス画面取得",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = urlInput,
+                        onValueChange = { urlInput = it },
+                        label = { Text("URL または ドメイン (例: google.com)") },
+                        placeholder = { Text("google.com / https://gc2223.com") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("url_crawl_input"),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CrawlMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = crawlMode == mode,
+                                onClick = { crawlMode = mode },
+                                label = { Text(mode.label) },
+                                modifier = Modifier.testTag("crawl_mode_${mode.name}")
+                            )
+                        }
+                        DeviceViewportProfile.entries.forEach { profile ->
+                            FilterChip(
+                                selected = deviceProfile == profile,
+                                onClick = { deviceProfile = profile },
+                                label = { Text(profile.label) },
+                                modifier = Modifier.testTag("device_profile_${profile.name}")
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { onCrawlUrlOrDomain(urlInput, crawlMode, deviceProfile) },
+                            enabled = urlInput.isNotBlank() && !isCrawlingWeb,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("crawl_url_button")
+                        ) {
+                            if (isCrawlingWeb) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("取得中...")
+                            } else {
+                                Icon(Icons.Rounded.Language, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("クロール添付", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = { showDeviceCaptureDialog = true },
+                            enabled = urlInput.isNotBlank(),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("capture_device_screen_button")
+                        ) {
+                            Icon(Icons.Rounded.PhoneAndroid, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("デバイス画面", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+
+                    if (lastCrawlPreview != null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = "${lastCrawlPreview.targetUrl} (${lastCrawlPreview.pageCount}p • ${lastCrawlPreview.deviceProfileLabel})",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (lastCrawlPreview.summarySnippet.isNotBlank()) {
+                                    Text(
+                                        text = lastCrawlPreview.summarySnippet,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Multimodal Source Attachment Section (Markdown, PDF, Image, Video)
             Card(
                 colors = CardDefaults.cardColors(
@@ -300,12 +457,33 @@ fun AgentChatScreen(
                                             .padding(start = 10.dp, end = 4.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Icon(
-                                            imageVector = icon,
-                                            contentDescription = src.kind.name,
-                                            tint = MaterialTheme.colorScheme.secondary,
-                                            modifier = Modifier.size(18.dp)
-                                        )
+                                        val thumbnail = remember(src.uriString, src.kind) {
+                                            if (src.kind == SourceAttachmentKind.IMAGE) {
+                                                runCatching {
+                                                    context.contentResolver.openInputStream(Uri.parse(src.uriString))?.use { stream ->
+                                                        val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                                                        BitmapFactory.decodeStream(stream, null, opts)?.asImageBitmap()
+                                                    }
+                                                }.getOrNull()
+                                            } else null
+                                        }
+                                        if (thumbnail != null) {
+                                            Image(
+                                                bitmap = thumbnail,
+                                                contentDescription = src.displayName,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier
+                                                    .size(34.dp)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = icon,
+                                                contentDescription = src.kind.name,
+                                                tint = MaterialTheme.colorScheme.secondary,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(
@@ -577,6 +755,17 @@ fun AgentChatScreen(
                 }
             }
         }
+    }
+
+    if (showDeviceCaptureDialog) {
+        DeviceCaptureDialog(
+            initialUrlOrDomain = urlInput,
+            profile = deviceProfile,
+            onDismiss = { showDeviceCaptureDialog = false },
+            onCaptureBitmap = { bmp ->
+                onAttachDeviceScreenshot(bmp, urlInput, deviceProfile)
+            }
+        )
     }
 }
 

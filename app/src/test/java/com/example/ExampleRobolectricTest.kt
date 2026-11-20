@@ -1,27 +1,38 @@
 package com.example
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.workDataOf
+import com.example.data.CloudBridgeClient
 import com.example.data.GitHubActivityService
 import com.example.data.LocalSecretsStore
 import com.example.data.MultimodalSourceLoader
+import com.example.data.OrchestrationHardeningClient
+import com.example.data.StackTemplates
 import com.example.data.SyncSnapshotStore
+import com.example.data.WebContextCrawler
 import com.example.model.BackgroundSyncSettings
 import com.example.model.CloudflareSyncStatus
 import com.example.model.CloudflareWorkerSummary
+import com.example.model.CrawlMode
+import com.example.model.DeviceViewportProfile
+import com.example.model.EmailRouteTarget
 import com.example.model.ExternalCredentials
 import com.example.model.GitHubActivityEvent
 import com.example.model.GitHubCommitSummary
 import com.example.model.GitHubRepoSummary
 import com.example.model.GitHubSyncStatus
+import com.example.model.OrchestrationTaskType
 import com.example.model.SourceAttachmentKind
 import com.example.model.SyncHealthState
 import com.example.model.SyncStatusSnapshot
+import com.example.model.TerraformAction
 import com.example.model.TermuxAgentSyncStatus
+import com.example.model.TermuxPresetCommand
 import com.example.sync.CloudStatusSyncWorker
 import com.example.sync.TermuxAgentSyncWorker
 import com.google.firebase.ai.type.InlineDataPart
@@ -405,6 +416,443 @@ class ExampleRobolectricTest {
       mdFile.delete()
       pdfFile.delete()
       mp4File.delete()
+    }
+  }
+
+  @Test
+  fun `web context crawler crawls domain pages saves markdown and device bitmap png`() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val ss = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+    val port = ss.localPort
+    val serverThread = Thread {
+      runCatching {
+        ss.soTimeout = 5000
+        while (!ss.isClosed) {
+          val sock = runCatching { ss.accept() }.getOrNull() ?: break
+          sock.use {
+            val reader = it.getInputStream().bufferedReader()
+            val reqLine = reader.readLine().orEmpty()
+            while (true) {
+              val h = reader.readLine() ?: break
+              if (h.isEmpty()) break
+            }
+            val path = reqLine.split(" ").getOrNull(1).orEmpty()
+            val html = when {
+              path.startsWith("/docs") -> "<html><head><title>Docs Page</title></head><body><h1>API Docs</h1><p>Terraform and Worker guide.</p></body></html>"
+              else -> "<html><head><title>Root Portal</title><meta name=\"description\" content=\"AntiGravity Portal\"></head><body><h1>Welcome</h1><a href=\"/docs\">Docs</a><p>Main page body</p></body></html>"
+            }
+            val bytes = html.toByteArray(Charsets.UTF_8)
+            val resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+            it.getOutputStream().apply {
+              write(resp.toByteArray(Charsets.UTF_8))
+              write(bytes)
+              flush()
+            }
+          }
+        }
+      }
+    }.apply { start() }
+
+    try {
+      val crawler = WebContextCrawler(context)
+      assertEquals("https://google.com", crawler.normalizeUrlOrDomain("google.com"))
+
+      val res = crawler.crawlAndCapture(
+        rawUrlOrDomain = "http://127.0.0.1:$port",
+        mode = CrawlMode.DOMAIN_CRAWL,
+        profile = DeviceViewportProfile.PIXEL_9_PRO
+      )
+      assertTrue(res.isSuccess)
+      val out = res.getOrThrow()
+      assertEquals(2, out.pageCount)
+      assertTrue(out.markdownContent.contains("Root Portal"))
+      assertTrue(out.markdownContent.contains("API Docs"))
+
+      val bmp = Bitmap.createBitmap(120, 240, Bitmap.Config.ARGB_8888)
+      val pngUri = crawler.saveDeviceScreenshotBitmap(bmp, "http://127.0.0.1:$port", DeviceViewportProfile.IPHONE_16_PRO)
+      bmp.recycle()
+
+      val loader = MultimodalSourceLoader(context)
+      val mdSrc = loader.inspectUri(out.markdownUri)!!
+      val pngSrc = loader.inspectUri(pngUri)!!
+      assertEquals(SourceAttachmentKind.MARKDOWN, mdSrc.kind)
+      assertEquals(SourceAttachmentKind.IMAGE, pngSrc.kind)
+    } finally {
+      runCatching { ss.close() }
+      runCatching { serverThread.join(1000) }
+    }
+  }
+
+  @Test
+  fun `cloud bridge client commits terraform dispatches plan rerun and triggers email worker`() = runTest {
+    val ss = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+    val port = ss.localPort
+    val recordedRequests = java.util.Collections.synchronizedList(mutableListOf<String>())
+    val serverThread = Thread {
+      runCatching {
+        ss.soTimeout = 5000
+        while (!ss.isClosed) {
+          val sock = runCatching { ss.accept() }.getOrNull() ?: break
+          sock.use {
+            val reader = it.getInputStream().bufferedReader()
+            val reqLine = reader.readLine().orEmpty()
+            recordedRequests.add(reqLine)
+            var contentLen = 0
+            while (true) {
+              val h = reader.readLine() ?: break
+              if (h.isEmpty()) break
+              if (h.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+              }
+            }
+            if (contentLen > 0) {
+              val buf = CharArray(contentLen)
+              reader.read(buf, 0, contentLen)
+            }
+            val (code, body) = when {
+              reqLine.contains("/contents/") && reqLine.startsWith("GET") -> 200 to """{"sha":"oldsha123"}"""
+              reqLine.contains("/contents/") && reqLine.startsWith("PUT") -> 200 to """{"commit":{"sha":"newsha999"}}"""
+              reqLine.contains("/dispatches") -> 204 to ""
+              reqLine.contains("/rerun-failed-jobs") -> 201 to ""
+              reqLine.contains("/v1/workflow-error") -> 200 to """{"ok":true,"rerunStatus":"RERUN_TRIGGERED"}"""
+              else -> 200 to "{}"
+            }
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            val statusText = when (code) {
+              204 -> "No Content"
+              201 -> "Created"
+              else -> "OK"
+            }
+            val resp = "HTTP/1.1 $code $statusText\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+            it.getOutputStream().apply {
+              write(resp.toByteArray(Charsets.UTF_8))
+              write(bytes)
+              flush()
+            }
+          }
+        }
+      }
+    }.apply { start() }
+
+    try {
+      val bridge = CloudBridgeClient(githubApiBaseUrl = "http://127.0.0.1:$port")
+
+      val pushRes = bridge.commitFileToGitHub(
+        pat = "pat_123",
+        ownerRepo = "user/repo",
+        filePath = "infra/main.tf",
+        content = "terraform {}",
+        commitMessage = "Add tf"
+      )
+      assertTrue(pushRes.success)
+      assertTrue(pushRes.message.contains("newsha9"))
+
+      val tfRes = bridge.dispatchTerraformWorkflow(
+        pat = "pat_123",
+        ownerRepo = "user/repo",
+        action = TerraformAction.PLAN,
+        targetEnv = "dev"
+      )
+      assertTrue(tfRes.success)
+
+      val rerunRes = bridge.rerunFailedGitHubWorkflow("pat_123", "user/repo", 98765L)
+      assertTrue(rerunRes.success)
+
+      val emailRes = bridge.triggerEmailSelfHealWorker(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "tok",
+        firebaseIdToken = null,
+        recipientEmail = "17crown2223@gmail.com",
+        ownerRepo = "user/repo",
+        workflowFile = "antigravity-terraform.yml",
+        runId = 98765L,
+        errorLog = "403 API disabled",
+        suggestedPatch = "enable service",
+        retryCount = 0
+      )
+      assertTrue(emailRes.success)
+      assertTrue(recordedRequests.any { it.contains("/v1/workflow-error") })
+      assertTrue(StackTemplates.all.any { it.category == "TERRAFORM" })
+      assertTrue(StackTemplates.all.any { it.category == "SELF_HEAL" })
+    } finally {
+      runCatching { ss.close() }
+      runCatching { serverThread.join(1000) }
+    }
+  }
+
+  @Test
+  fun `cloud bridge client executes whitelisted termux preset via POST run`() = runTest {
+    val ss = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+    val port = ss.localPort
+    var capturedBody = ""
+    var capturedAuth = ""
+    val serverThread = Thread {
+      runCatching {
+        ss.soTimeout = 5000
+        ss.accept().use { sock ->
+          val reader = sock.getInputStream().bufferedReader()
+          val reqLine = reader.readLine().orEmpty()
+          var contentLen = 0
+          while (true) {
+            val h = reader.readLine() ?: break
+            if (h.isEmpty()) break
+            if (h.startsWith("Authorization:", ignoreCase = true)) {
+              capturedAuth = h.substringAfter(":").trim()
+            }
+            if (h.startsWith("Content-Length:", ignoreCase = true)) {
+              contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+            }
+          }
+          if (contentLen > 0) {
+            val buf = CharArray(contentLen)
+            reader.read(buf, 0, contentLen)
+            capturedBody = String(buf)
+          }
+          val body = if (reqLine.startsWith("POST /run")) {
+            """{"ok":true,"preset":"tf_plan","exitCode":0,"stdout":"No changes. Infrastructure is up-to-date.","stderr":"","durationMs":412}"""
+          } else {
+            """{"error":"not found"}"""
+          }
+          val bytes = body.toByteArray(Charsets.UTF_8)
+          val resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+          sock.getOutputStream().apply {
+            write(resp.toByteArray(Charsets.UTF_8))
+            write(bytes)
+            flush()
+          }
+        }
+      }
+    }.apply { start() }
+
+    try {
+      val bridge = CloudBridgeClient()
+      val res = bridge.executeTermuxSafeCommand(
+        agentUrl = "http://127.0.0.1:$port",
+        bearerToken = "local_secret_123",
+        preset = TermuxPresetCommand.TF_PLAN,
+        workdir = "~/OrchestraAntiGravity"
+      )
+      assertTrue(res.success)
+      assertEquals(0, res.exitCode)
+      assertEquals("tf_plan", res.presetId)
+      assertTrue(res.stdout.contains("Infrastructure is up-to-date"))
+      assertEquals("Bearer local_secret_123", capturedAuth)
+      val parsedReq = org.json.JSONObject(capturedBody)
+      assertEquals("tf_plan", parsedReq.getString("preset"))
+      assertEquals("~/OrchestraAntiGravity", parsedReq.getString("workdir"))
+
+      val termuxTpl = StackTemplates.all.first { it.id == "termux_antigravity_cli" }.content
+      assertTrue(termuxTpl.contains("ALLOWED_PRESETS"))
+      assertTrue(termuxTpl.contains("antigravity heal"))
+      assertTrue(termuxTpl.contains("pull-task)"))
+    } finally {
+      runCatching { ss.close() }
+      runCatching { serverThread.join(1000) }
+    }
+  }
+
+  @Test
+  fun `cloud bridge client triggers unified orchestration and validates terraform email router templates`() = runTest {
+    val ss = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+    val port = ss.localPort
+    var capturedPostBody = ""
+    var capturedFirebaseHdr = ""
+    val serverThread = Thread {
+      runCatching {
+        ss.soTimeout = 5000
+        repeat(2) {
+          ss.accept().use { sock ->
+            val reader = sock.getInputStream().bufferedReader()
+            val reqLine = reader.readLine().orEmpty()
+            var contentLen = 0
+            while (true) {
+              val h = reader.readLine() ?: break
+              if (h.isEmpty()) break
+              if (h.startsWith("X-Firebase-Token:", ignoreCase = true)) {
+                capturedFirebaseHdr = h.substringAfter(":").trim()
+              }
+              if (h.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+              }
+            }
+            if (contentLen > 0) {
+              val buf = CharArray(contentLen)
+              reader.read(buf, 0, contentLen)
+              capturedPostBody = String(buf)
+            }
+            val respBody = when {
+              reqLine.startsWith("POST /v1/orchestrate") ->
+                """{"ok":true,"taskType":"tf_plan","detail":"OK_DISPATCHED_antigravity-terraform.yml"}"""
+              reqLine.startsWith("GET /v1/termux/next-task") ->
+                """{"ok":true,"hasTask":true,"task":{"preset":"git_pull","workdir":"~/OrchestraAntiGravity"}}"""
+              else -> """{"error":"unexpected"}"""
+            }
+            val bytes = respBody.toByteArray(Charsets.UTF_8)
+            val hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+            sock.getOutputStream().apply {
+              write(hdr.toByteArray(Charsets.UTF_8))
+              write(bytes)
+              flush()
+            }
+          }
+        }
+      }
+    }.apply { start() }
+
+    try {
+      val bridge = CloudBridgeClient()
+      val orchRes = bridge.triggerOrchestrationTask(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_token_abc",
+        firebaseIdToken = "fb_jwt_xyz",
+        routeTarget = EmailRouteTarget.TERRAFORM,
+        taskType = OrchestrationTaskType.TF_PLAN,
+        ownerRepo = "17crown1901mituru/OrchestraAntiGravity",
+        promptOrInput = "plan prod",
+        targetEnv = "prod"
+      )
+      assertTrue(orchRes.success)
+      assertEquals(200, orchRes.statusCode)
+      assertEquals("tf@gc2223.com", orchRes.routeAddress)
+      assertTrue(orchRes.detail.contains("OK_DISPATCHED_antigravity-terraform.yml"))
+      assertEquals("fb_jwt_xyz", capturedFirebaseHdr)
+
+      val reqJson = org.json.JSONObject(capturedPostBody)
+      assertEquals("tf_plan", reqJson.getString("taskType"))
+      assertEquals("tf@gc2223.com", reqJson.getString("routeAddress"))
+      assertEquals("prod", reqJson.getJSONObject("payload").getString("targetEnv"))
+      assertTrue(reqJson.getString("traceId").isNotBlank())
+      assertTrue(orchRes.traceId.isNotBlank())
+
+      val queueRes = bridge.fetchPendingTermuxQueueTask(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_token_abc",
+        firebaseIdToken = "fb_jwt_xyz"
+      )
+      assertTrue(queueRes.success)
+      assertTrue(queueRes.message.contains("git_pull"))
+
+      val tfContent = StackTemplates.all.first { it.id == "terraform_llm_infra" }.content
+      assertTrue(tfContent.contains("cloudflare_email_routing_rule"))
+      assertTrue(tfContent.contains("cloudflare_workers_kv_namespace"))
+      assertTrue(tfContent.contains("google_pubsub_topic"))
+
+      val workerContent = StackTemplates.all.first { it.id == "cf_email_autofix_worker" }.content
+      assertTrue(workerContent.contains("localPart === \"tf\""))
+      assertTrue(workerContent.contains("localPart === \"crawl\""))
+      assertTrue(workerContent.contains("async scheduled(event, env, ctx)"))
+      assertTrue(workerContent.contains("APPROVE APPLY"))
+      assertTrue(workerContent.contains("LEASED"))
+      assertTrue(workerContent.contains("dlq:"))
+      assertTrue(workerContent.contains("SAFE_MODE"))
+      assertTrue(workerContent.contains("In-Reply-To"))
+      assertTrue(workerContent.contains("loadCiKnowledge"))
+      assertTrue(workerContent.contains("github-authentication-token-expiration"))
+
+      val termuxContent = StackTemplates.all.first { it.id == "termux_antigravity_cli" }.content
+      assertTrue(termuxContent.contains("X-Device-Battery"))
+
+      assertTrue(StackTemplates.all.any { it.id == "github_actions_orchestrator" })
+    } finally {
+      runCatching { ss.close() }
+      runCatching { serverThread.join(1000) }
+    }
+  }
+
+  @Test
+  fun `orchestration hardening client fetches state approvals audit and toggles safe mode`() = runTest {
+    val ss = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+    val port = ss.localPort
+    val recordedBodies = java.util.Collections.synchronizedList(mutableListOf<String>())
+    val serverThread = Thread {
+      runCatching {
+        ss.soTimeout = 5000
+        repeat(5) {
+          val sock = runCatching { ss.accept() }.getOrNull() ?: return@repeat
+          sock.use { s ->
+            val reader = s.getInputStream().bufferedReader()
+            val reqLine = reader.readLine().orEmpty()
+            var contentLen = 0
+            while (true) {
+              val h = reader.readLine() ?: break
+              if (h.isEmpty()) break
+              if (h.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+              }
+            }
+            if (contentLen > 0) {
+              val buf = CharArray(contentLen)
+              reader.read(buf, 0, contentLen)
+              recordedBodies.add(String(buf))
+            }
+            val respBody = when {
+              reqLine.startsWith("GET /v1/orchestrate/state") ->
+                """{"ok":true,"safeMode":false,"safeReason":"","aiHour":4,"ghHour":2,"dlqCount":1,"approvalsCount":1,"heartbeat":{"battery":82,"charging":true,"network":"wifi","seenAt":"2026-11-20T06:00:00Z"},"cron":{"at":"2026-11-20T06:00:00Z","conclusion":"success","patExpiry":""}}"""
+              reqLine.startsWith("GET /v1/approvals") ->
+                """{"ok":true,"approvals":[{"approvalId":"appr7788","action":"tf_apply","repo":"user/repo","targetEnv":"prod","summary":"Terraform apply (prod)","traceId":"trc123456","expiresAtMs":1900000000000}]}"""
+              reqLine.startsWith("GET /v1/audit") ->
+                """{"ok":true,"logs":[{"traceId":"trc123456","source":"email:tf@","taskType":"tf","ok":true,"summary":"Plan dispatched","timestamp":"2026-11-20T05:59:00Z"}]}"""
+              reqLine.startsWith("POST /v1/approvals/decide") ->
+                """{"ok":true,"approvalId":"appr7788","approved":true,"detail":"OK_DISPATCHED_antigravity-terraform.yml","traceId":"trc123456"}"""
+              reqLine.startsWith("POST /v1/circuit-breaker") ->
+                """{"ok":true,"safeMode":true,"traceId":"trc999"}"""
+              else -> """{"error":"not found"}"""
+            }
+            val bytes = respBody.toByteArray(Charsets.UTF_8)
+            val hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+            s.getOutputStream().apply {
+              write(hdr.toByteArray(Charsets.UTF_8))
+              write(bytes)
+              flush()
+            }
+          }
+        }
+      }
+    }.apply { start() }
+
+    try {
+      val hardeningClient = OrchestrationHardeningClient()
+      val snapshot = hardeningClient.fetchHardeningSnapshot(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok"
+      )
+      assertFalse(snapshot.safeMode)
+      assertEquals(4, snapshot.aiHourCount)
+      assertEquals(2, snapshot.ghHourCount)
+      assertEquals(1, snapshot.dlqCount)
+      assertEquals(82, snapshot.termuxBatteryPct)
+      assertEquals(true, snapshot.termuxCharging)
+      assertEquals("wifi", snapshot.termuxNetwork)
+      assertEquals("success", snapshot.cronLastConclusion)
+      assertEquals(1, snapshot.approvals.size)
+      assertEquals("appr7788", snapshot.approvals.first().approvalId)
+      assertEquals(1, snapshot.recentAuditLogs.size)
+      assertEquals("trc123456", snapshot.recentAuditLogs.first().traceId)
+
+      val decideRes = hardeningClient.decideApproval(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok",
+        approvalId = "appr7788",
+        approve = true
+      )
+      assertTrue(decideRes.success)
+      assertTrue(decideRes.message.contains("OK_DISPATCHED_antigravity-terraform.yml"))
+      assertTrue(recordedBodies.any { it.contains("\"approvalId\":\"appr7788\"") && it.contains("\"approve\":true") })
+
+      val cbRes = hardeningClient.toggleCircuitBreakerSafeMode(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok",
+        enableSafeMode = true,
+        reason = "Test trigger"
+      )
+      assertTrue(cbRes.success)
+      assertTrue(recordedBodies.any { it.contains("\"safeMode\":true") })
+    } finally {
+      runCatching { ss.close() }
+      runCatching { serverThread.join(1000) }
     }
   }
 }

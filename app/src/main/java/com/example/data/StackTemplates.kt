@@ -178,11 +178,11 @@ crons = ["0 */6 * * *"]
         ),
         StackTemplate(
             id = "termux_antigravity_cli",
-            title = "Termux AntiGravityAgent CLI + ローカル /status デーモン",
+            title = "Termux AntiGravityAgent CLI + /status & 安全な /run 実行ブリッジ",
             category = "TERMUX",
             targetHost = "Termux (Android)",
-            subtitle = "CLI 実行履歴を state.json に記録し、`antigravity serve` で 127.0.0.1:8787/status を公開して本アプリと同期",
-            freeTierSummary = "端末ローカル実行（¥0）＋ WorkManager リアルタイム同期",
+            subtitle = "127.0.0.1:8787 で /status 同期とホワイトリスト制 POST /run を提供し、pull-task でバッテリー/回線ヘッダ付き Lease 実行に対応",
+            freeTierSummary = "端末ローカル実行（¥0）＋ 双方向実行・Self-Heal 連携",
             content = """#!/data/data/com.termux/files/usr/bin/bash
 # Run in Termux on Android
 pkg update -y && pkg install -y curl jq git python
@@ -192,12 +192,21 @@ export PATH="${'$'}HOME/.local/bin:${'$'}PATH"
 
 cat > "${'$'}HOME/.local/bin/antigravity-status-server.py" << 'PYEOF'
 #!/usr/bin/env python3
-import http.server, json, os, sys, time
+import http.server, json, os, subprocess, sys, time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
 STATE_FILE = os.path.expanduser("~/.config/antigravity/state.json")
 TOKEN = os.environ.get("ANTIGRAVITY_LOCAL_TOKEN", "").strip()
+HOME_DIR = os.path.realpath(os.path.expanduser("~"))
 START_TIME = time.time()
+
+ALLOWED_PRESETS = {
+    "antigravity_health": [os.path.expanduser("~/.local/bin/antigravity"), "health"],
+    "git_pull": ["git", "pull", "--ff-only"],
+    "tf_plan": ["terraform", "-chdir=infra", "plan", "-no-color", "-input=false"],
+    "tf_apply": ["terraform", "-chdir=infra", "apply", "-no-color", "-input=false", "-auto-approve"],
+    "wrangler_deploy": ["npx", "wrangler", "deploy"],
+}
 
 def read_state():
     data = {}
@@ -209,7 +218,7 @@ def read_state():
             data = {}
     return {
         "agentName": "AntiGravityAgent",
-        "version": "1.2.0",
+        "version": "1.4.0",
         "state": data.get("state", "IDLE"),
         "pid": os.getpid(),
         "activeTask": data.get("activeTask", ""),
@@ -221,23 +230,87 @@ def read_state():
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
+def write_state(state, active_task, last_cmd, exit_code):
+    cur = read_state()
+    payload = {
+        "state": state,
+        "activeTask": active_task,
+        "lastCommand": last_cmd,
+        "lastExitCode": exit_code,
+        "lastRunAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requestsToday": cur.get("requestsToday", 0) + 1,
+    }
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
 class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _authorized(self):
         if TOKEN and self.headers.get("Authorization", "") != f"Bearer {TOKEN}":
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b'{"error":"Unauthorized"}')
+            return False
+        return True
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self._authorized():
             return
         if self.path.split("?")[0] in ("/status", "/health"):
-            body = json.dumps(read_state()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(200, read_state())
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if not self._authorized():
+            return
+        if self.path.split("?")[0] != "/run":
+            self._send_json(404, {"error": "Not found"})
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(min(length, 16384)).decode("utf-8", errors="replace")
+        try:
+            req = json.loads(raw or "{}")
+        except Exception:
+            self._send_json(400, {"error": "Invalid JSON"})
+            return
+        preset = str(req.get("preset", "")).strip()
+        if preset not in ALLOWED_PRESETS:
+            self._send_json(403, {"error": f"Preset '{preset}' is not whitelisted"})
+            return
+        raw_dir = str(req.get("workdir", "")).strip()
+        cwd = os.path.realpath(os.path.expanduser(raw_dir)) if raw_dir else HOME_DIR
+        if not (cwd == HOME_DIR or cwd.startswith(HOME_DIR + os.sep)) or not os.path.isdir(cwd):
+            cwd = HOME_DIR
+        cmd = ALLOWED_PRESETS[preset]
+        write_state("RUNNING", preset, " ".join(cmd), 0)
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=180)
+            dur_ms = int((time.time() - t0) * 1000)
+            final_state = "IDLE" if proc.returncode == 0 else "ERROR"
+            write_state(final_state, "", " ".join(cmd), proc.returncode)
+            self._send_json(200, {
+                "ok": proc.returncode == 0,
+                "preset": preset,
+                "exitCode": proc.returncode,
+                "stdout": (proc.stdout or "")[-4000:],
+                "stderr": (proc.stderr or "")[-4000:],
+                "durationMs": dur_ms,
+            })
+        except Exception as exc:
+            dur_ms = int((time.time() - t0) * 1000)
+            write_state("ERROR", "", " ".join(cmd), 1)
+            self._send_json(500, {"ok": False, "preset": preset, "exitCode": 1, "stderr": str(exc), "durationMs": dur_ms})
+
     def log_message(self, format, *args):
         pass
 
@@ -269,7 +342,7 @@ record_state() {
 case "${'$'}{1:-}" in
   serve)
     PORT="${'$'}{2:-8787}"
-    echo "AntiGravityAgent status daemon listening on http://127.0.0.1:${'$'}{PORT}/status"
+    echo "AntiGravityAgent status & /run bridge listening on http://127.0.0.1:${'$'}{PORT}"
     exec python3 "${'$'}HOME/.local/bin/antigravity-status-server.py" "${'$'}PORT"
     ;;
   health)
@@ -287,11 +360,78 @@ case "${'$'}{1:-}" in
       -d "${'$'}(jq -n --arg r "${'$'}REPO" --arg w "${'$'}WF" '{repo:${'$'}r,workflow:${'$'}w}')" | jq .
     record_state "IDLE" "" "antigravity dispatch ${'$'}REPO" 0
     ;;
+  tf)
+    ACTION="${'$'}{2:-plan}"
+    ENV_NAME="${'$'}{3:-dev}"
+    record_state "RUNNING" "tf:${'$'}ACTION" "antigravity tf ${'$'}ACTION ${'$'}ENV_NAME" 0
+    if [ -d "./infra" ] && command -v terraform >/dev/null 2>&1; then
+      terraform -chdir=infra init -input=false && terraform -chdir=infra "${'$'}ACTION" -no-color
+    else
+      echo "Remote Terraform dispatch via GitHub Actions (${'$'}ACTION / ${'$'}ENV_NAME):"
+      echo "Use Hub App or: gh workflow run antigravity-terraform.yml -f tf_action=${'$'}ACTION -f target_env=${'$'}ENV_NAME"
+    fi
+    record_state "IDLE" "" "antigravity tf ${'$'}ACTION" 0
+    ;;
+  heal)
+    LOG_FILE="${'$'}{2:?Usage: antigravity heal <error_log_file> [owner/repo]}"
+    REPO="${'$'}{3:-17crown1901mituru/OrchestraAntiGravity}"
+    LOG_TAIL="${'$'}(tail -n 80 "${'$'}LOG_FILE")"
+    record_state "RUNNING" "self-heal" "antigravity heal ${'$'}LOG_FILE" 0
+    curl -sS -X POST "${'$'}GATEWAY/v1/workflow-error" \
+      -H "Authorization: Bearer ${'$'}TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "${'$'}(jq -n --arg r "${'$'}REPO" --arg l "${'$'}LOG_TAIL" '{repo:${'$'}r,workflow:"local-termux",runId:0,retryCount:0,errorLog:${'$'}l}')" | jq .
+    record_state "IDLE" "" "antigravity heal" 0
+    ;;
+  crawl)
+    TARGET="${'$'}{2:?Usage: antigravity crawl <url_or_domain>}"
+    record_state "RUNNING" "crawl:${'$'}TARGET" "antigravity crawl ${'$'}TARGET" 0
+    curl -sS -X POST "${'$'}GATEWAY/v1/chat" \
+      -H "Authorization: Bearer ${'$'}TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "${'$'}(jq -n --arg p "Analyze and summarize solution architecture for ${'$'}TARGET" '{prompt:${'$'}p,mode:"cli"}')" | jq -r '.reply // .'
+    record_state "IDLE" "" "antigravity crawl" 0
+    ;;
+  pull-task)
+    LOCAL_PORT="${'$'}{2:-8787}"
+    BAT_PCT=100
+    CHARGING="true"
+    if command -v termux-battery-status >/dev/null 2>&1; then
+      BAT_JSON="${'$'}(termux-battery-status 2>/dev/null || echo '{}')"
+      BAT_PCT="${'$'}(echo "${'$'}BAT_JSON" | jq -r '.percentage // 100')"
+      BAT_ST="${'$'}(echo "${'$'}BAT_JSON" | jq -r '.status // "CHARGING"')"
+      [ "${'$'}BAT_ST" = "CHARGING" ] || [ "${'$'}BAT_ST" = "FULL" ] && CHARGING="true" || CHARGING="false"
+    fi
+    TASK_JSON="${'$'}(curl -sS -H "Authorization: Bearer ${'$'}TOKEN" -H "X-Device-Battery: ${'$'}BAT_PCT" -H "X-Device-Charging: ${'$'}CHARGING" -H "X-Device-Network: termux" "${'$'}GATEWAY/v1/termux/next-task")"
+    HAS_TASK="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.hasTask // false')"
+    if [ "${'$'}HAS_TASK" != "true" ]; then
+      echo "No executable Termux task (${'$'}(echo "${'$'}TASK_JSON" | jq -r '.deferredReason // "queue empty"'))."
+      exit 0
+    fi
+    PRESET="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.preset')"
+    WORKDIR="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.workdir // ""')"
+    TRACE_ID="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.traceId // ""')"
+    echo "Executing leased preset '${'$'}PRESET' (trace=${'$'}TRACE_ID) via local bridge..."
+    RUN_RES="${'$'}(curl -sS -X POST "http://127.0.0.1:${'$'}{LOCAL_PORT}/run" \
+      -H "Content-Type: application/json" \
+      ${'$'}{ANTIGRAVITY_LOCAL_TOKEN:+-H "Authorization: Bearer ${'$'}ANTIGRAVITY_LOCAL_TOKEN"} \
+      -d "${'$'}(jq -n --arg p "${'$'}PRESET" --arg w "${'$'}WORKDIR" '{preset:${'$'}p,workdir:${'$'}w}')")"
+    ACK_PAYLOAD="${'$'}(echo "${'$'}RUN_RES" | jq --arg tid "${'$'}TRACE_ID" '. + {traceId: ${'$'}tid}')"
+    curl -sS -X POST "${'$'}GATEWAY/v1/termux/ack" \
+      -H "Authorization: Bearer ${'$'}TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "${'$'}ACK_PAYLOAD" >/dev/null
+    echo "${'$'}ACK_PAYLOAD" | jq .
+    ;;
   "")
-    echo "AntiGravityAgent CLI"
-    echo "  antigravity serve [port]   # Start local /status daemon (default 8787)"
+    echo "AntiGravityAgent CLI v1.4"
+    echo "  antigravity serve [port]            # Start /status + whitelisted /run bridge (default 8787)"
     echo "  antigravity health"
     echo "  antigravity dispatch owner/repo [workflow.yml]"
+    echo "  antigravity tf <plan|apply> [env]   # Run local or print remote Terraform dispatch"
+    echo "  antigravity heal <logfile> [repo]   # Send error log to Email Self-Heal Worker"
+    echo "  antigravity crawl <url>             # Summarize URL/domain solution via Gateway"
+    echo "  antigravity pull-task [local_port]  # Pull & run Email-queued safe task on Termux"
     echo "  antigravity <natural language prompt>"
     ;;
   *)
@@ -320,7 +460,7 @@ ANTIGRAVITY_TOKEN="YOUR_BEARER_TOKEN_HERE"
 # ANTIGRAVITY_LOCAL_TOKEN=""
 EOF
 
-echo "Done! Run 'antigravity serve' in Termux to stream local status to AntiGravity Hub."
+echo "Done! Run 'antigravity serve' in Termux for /status sync + whitelisted /run bridge."
 """
         ),
         StackTemplate(
@@ -365,7 +505,7 @@ export PROJECT_ID="gen-lang-client-0439741065"
 gcloud config set project "${'$'}PROJECT_ID"
 
 # 2. Enable free-tier-friendly APIs & Budget Notifications
-gcloud services enable run.googleapis.com workflows.googleapis.com billingbudgets.googleapis.com monitoring.googleapis.com
+gcloud services enable run.googleapis.com workflows.googleapis.com billingbudgets.googleapis.com monitoring.googleapis.com pubsub.googleapis.com
 
 # 3. Create email notification channel for 17crown2223@gmail.com
 gcloud beta monitoring channels create \
@@ -393,5 +533,5 @@ gcloud run deploy antigravity-core \
   --allow-unauthenticated
 """
         )
-    )
+    ) + OrchestrationTemplates.all
 }

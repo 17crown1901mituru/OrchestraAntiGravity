@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -9,7 +10,10 @@ import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
 import com.example.data.MultimodalSourceLoader
+import com.example.data.OrchestrationHardeningClient
+import com.example.data.StackTemplates
 import com.example.data.SyncSnapshotStore
+import com.example.data.WebContextCrawler
 import com.example.model.AgentBlueprint
 import com.example.model.AiGenerationState
 import com.example.model.AttachedSource
@@ -17,11 +21,21 @@ import com.example.model.BackgroundSyncSettings
 import com.example.model.CostAlert
 import com.example.model.CostConfig
 import com.example.model.CostEntry
+import com.example.model.CrawlMode
+import com.example.model.DeviceViewportProfile
+import com.example.model.EmailRouteTarget
 import com.example.model.ExternalCredentials
 import com.example.model.InferenceTarget
+import com.example.model.OrchestrationHardeningState
+import com.example.model.OrchestrationRunResult
+import com.example.model.OrchestrationTaskType
 import com.example.model.StreamUiState
 import com.example.model.SyncStatusSnapshot
+import com.example.model.TerraformAction
+import com.example.model.TermuxCommandResult
+import com.example.model.TermuxPresetCommand
 import com.example.model.VaultMetadata
+import com.example.model.WebCrawlPreview
 import com.example.model.WorkflowNode
 import com.example.model.WorkflowPlanResult
 import com.example.sync.BackgroundSyncScheduler
@@ -164,6 +178,39 @@ class HubViewModel(
     val attachedSources: StateFlow<List<AttachedSource>> = _attachedSources.asStateFlow()
 
     private val sourceLoader by lazy { MultimodalSourceLoader(applicationContext) }
+    private val webCrawler by lazy { WebContextCrawler(applicationContext) }
+
+    private val _isCrawlingWeb = MutableStateFlow(false)
+    val isCrawlingWeb: StateFlow<Boolean> = _isCrawlingWeb.asStateFlow()
+
+    private val _lastCrawlPreview = MutableStateFlow<WebCrawlPreview?>(null)
+    val lastCrawlPreview: StateFlow<WebCrawlPreview?> = _lastCrawlPreview.asStateFlow()
+
+    private val _isSelfHealing = MutableStateFlow(false)
+    val isSelfHealing: StateFlow<Boolean> = _isSelfHealing.asStateFlow()
+
+    private val _selfHealReport = MutableStateFlow<String?>(null)
+    val selfHealReport: StateFlow<String?> = _selfHealReport.asStateFlow()
+
+    private val _isRunningTermuxCommand = MutableStateFlow(false)
+    val isRunningTermuxCommand: StateFlow<Boolean> = _isRunningTermuxCommand.asStateFlow()
+
+    private val _lastTermuxCommandResult = MutableStateFlow<TermuxCommandResult?>(null)
+    val lastTermuxCommandResult: StateFlow<TermuxCommandResult?> = _lastTermuxCommandResult.asStateFlow()
+
+    private val _isOrchestrating = MutableStateFlow(false)
+    val isOrchestrating: StateFlow<Boolean> = _isOrchestrating.asStateFlow()
+
+    private val _lastOrchestrationResult = MutableStateFlow<OrchestrationRunResult?>(null)
+    val lastOrchestrationResult: StateFlow<OrchestrationRunResult?> = _lastOrchestrationResult.asStateFlow()
+
+    private val hardeningClient by lazy { OrchestrationHardeningClient() }
+
+    private val _hardeningState = MutableStateFlow(OrchestrationHardeningState())
+    val hardeningState: StateFlow<OrchestrationHardeningState> = _hardeningState.asStateFlow()
+
+    private val _isHardeningBusy = MutableStateFlow(false)
+    val isHardeningBusy: StateFlow<Boolean> = _isHardeningBusy.asStateFlow()
 
     private val _credentials = MutableStateFlow(secretsStore.loadForUser(currentUserId))
     val credentials: StateFlow<ExternalCredentials> = _credentials.asStateFlow()
@@ -288,6 +335,422 @@ class HubViewModel(
 
     fun clearAttachedSources() {
         _attachedSources.value = emptyList()
+    }
+
+    fun crawlDomainOrUrl(
+        rawUrlOrDomain: String,
+        mode: CrawlMode,
+        profile: DeviceViewportProfile
+    ) {
+        if (rawUrlOrDomain.isBlank() || _isCrawlingWeb.value) return
+        viewModelScope.launch {
+            _isCrawlingWeb.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val result = webCrawler.crawlAndCapture(
+                    rawUrlOrDomain = rawUrlOrDomain,
+                    mode = mode,
+                    profile = profile,
+                    gatewayBaseUrl = creds.gc2223Endpoint,
+                    gatewayBearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+                result.onSuccess { output ->
+                    val newUris = buildList {
+                        add(output.markdownUri)
+                        output.screenshotUri?.let { add(it) }
+                    }
+                    addAttachedUris(newUris)
+                    _lastCrawlPreview.value = WebCrawlPreview(
+                        targetUrl = output.normalizedUrl,
+                        pageCount = output.pageCount,
+                        deviceProfileLabel = profile.label,
+                        summarySnippet = output.summarySnippet,
+                        attachedFileName = output.markdownFileName,
+                        hasScreenshot = output.screenshotUri != null
+                    )
+                    val screenSuffix = if (output.screenshotUri != null) " + 画面PNG" else ""
+                    _statusBanner.value = "${output.pageCount}ページ取得し添付しました ($screenSuffix)".replace("()", "").trim()
+                }.onFailure { err ->
+                    _statusBanner.value = "URL取得失敗: ${err.localizedMessage ?: "Network error"}"
+                }
+            } finally {
+                _isCrawlingWeb.value = false
+            }
+        }
+    }
+
+    fun attachDeviceScreenshotBitmap(
+        bitmap: Bitmap,
+        rawUrlOrDomain: String,
+        profile: DeviceViewportProfile
+    ) {
+        viewModelScope.launch {
+            runCatching {
+                val uri = webCrawler.saveDeviceScreenshotBitmap(bitmap, rawUrlOrDomain, profile)
+                addAttachedUris(listOf(uri))
+                val current = _lastCrawlPreview.value
+                _lastCrawlPreview.value = current?.copy(hasScreenshot = true) ?: WebCrawlPreview(
+                    targetUrl = webCrawler.normalizeUrlOrDomain(rawUrlOrDomain),
+                    pageCount = 1,
+                    deviceProfileLabel = profile.label,
+                    summarySnippet = "${profile.label} (${profile.widthDp}x${profile.heightDp}dp) 画面キャプチャ",
+                    attachedFileName = uri.lastPathSegment.orEmpty(),
+                    hasScreenshot = true
+                )
+                _statusBanner.value = "${profile.label} の最新画面を添付しました"
+            }.onFailure { err ->
+                _statusBanner.value = "画面キャプチャ保存に失敗: ${err.localizedMessage ?: "IO error"}"
+            }
+        }
+    }
+
+    fun pushTemplateToGitHub(
+        filePath: String,
+        content: String,
+        commitMessage: String
+    ) {
+        viewModelScope.launch {
+            _isBusyNodeAction.value = true
+            try {
+                val creds = _credentials.value
+                val res = bridgeClient.commitFileToGitHub(
+                    pat = creds.githubPat,
+                    ownerRepo = creds.githubOwnerRepo,
+                    filePath = filePath,
+                    content = content,
+                    commitMessage = commitMessage
+                )
+                _statusBanner.value = res.message
+            } finally {
+                _isBusyNodeAction.value = false
+            }
+        }
+    }
+
+    fun dispatchTerraformRun(
+        action: TerraformAction,
+        targetEnv: String = "dev",
+        workflowFile: String = "antigravity-terraform.yml"
+    ) {
+        viewModelScope.launch {
+            _isBusyNodeAction.value = true
+            try {
+                val creds = _credentials.value
+                val res = bridgeClient.dispatchTerraformWorkflow(
+                    pat = creds.githubPat,
+                    ownerRepo = creds.githubOwnerRepo,
+                    workflowFile = workflowFile,
+                    action = action,
+                    targetEnv = targetEnv
+                )
+                if (res.success) {
+                    repository.addCostEntry(
+                        userId = currentUserId,
+                        provider = "GITHUB",
+                        amountUsd = 0.0,
+                        usageSummary = "Terraform ${action.cliValue} ($targetEnv) on ${creds.githubOwnerRepo}",
+                        source = "AUTO_TELEMETRY"
+                    )
+                }
+                _statusBanner.value = res.message
+            } finally {
+                _isBusyNodeAction.value = false
+            }
+        }
+    }
+
+    fun pushAllOrchestrationStackToGitHub() {
+        if (_isBusyNodeAction.value) return
+        viewModelScope.launch {
+            _isBusyNodeAction.value = true
+            try {
+                val creds = _credentials.value
+                val targets = listOf(
+                    "terraform_llm_infra" to "infra/main.tf",
+                    "cf_email_autofix_worker" to "worker/src/worker.js",
+                    "wrangler_email_selfheal" to "worker/wrangler.toml",
+                    "github_actions_terraform" to ".github/workflows/antigravity-terraform.yml",
+                    "github_actions_orchestrator" to ".github/workflows/antigravity-orchestrator.yml"
+                )
+                var successCount = 0
+                var lastErr = ""
+                for ((tplId, path) in targets) {
+                    val tpl = StackTemplates.all.firstOrNull { it.id == tplId } ?: continue
+                    val res = bridgeClient.commitFileToGitHub(
+                        pat = creds.githubPat,
+                        ownerRepo = creds.githubOwnerRepo,
+                        filePath = path,
+                        content = tpl.content,
+                        commitMessage = "chore(antigravity): bootstrap orchestration stack ($path)"
+                    )
+                    if (res.success) {
+                        successCount++
+                    } else {
+                        lastErr = res.message
+                        break
+                    }
+                }
+                _statusBanner.value = if (successCount == targets.size) {
+                    "オーケストレーション構成 (${successCount}ファイル) を GitHub へ一括 Push しました"
+                } else {
+                    "一括 Push 中断 (${successCount}/${targets.size}): $lastErr"
+                }
+            } finally {
+                _isBusyNodeAction.value = false
+            }
+        }
+    }
+
+    fun runOrchestrationTask(
+        routeTarget: EmailRouteTarget,
+        taskType: OrchestrationTaskType,
+        promptOrInput: String,
+        targetEnv: String = "dev"
+    ) {
+        if (_isOrchestrating.value) return
+        viewModelScope.launch {
+            _isOrchestrating.value = true
+            try {
+                val creds = _credentials.value
+                val res = bridgeClient.triggerOrchestrationTask(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = fetchFirebaseIdToken(),
+                    routeTarget = routeTarget,
+                    taskType = taskType,
+                    ownerRepo = creds.githubOwnerRepo,
+                    promptOrInput = promptOrInput,
+                    targetEnv = targetEnv
+                )
+                _lastOrchestrationResult.value = res
+                _statusBanner.value = res.summary
+                if (res.success) {
+                    val tidSuffix = if (res.traceId.isNotBlank()) " [tid:${res.traceId}]" else ""
+                    repository.addCostEntry(
+                        userId = currentUserId,
+                        provider = "CLOUDFLARE",
+                        amountUsd = 0.0,
+                        usageSummary = "Orchestrate ${routeTarget.address} (${taskType.taskId})$tidSuffix".take(195),
+                        source = "AUTO_TELEMETRY"
+                    )
+                    refreshHardeningState()
+                }
+            } finally {
+                _isOrchestrating.value = false
+            }
+        }
+    }
+
+    fun refreshHardeningState() {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = fetchFirebaseIdToken()
+                )
+                _hardeningState.value = snapshot
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun decideApproval(approvalId: String, approve: Boolean) {
+        if (_isHardeningBusy.value || approvalId.isBlank()) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val res = hardeningClient.decideApproval(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken,
+                    approvalId = approvalId,
+                    approve = approve
+                )
+                _statusBanner.value = res.message
+                if (res.success) {
+                    repository.addCostEntry(
+                        userId = currentUserId,
+                        provider = "CLOUDFLARE",
+                        amountUsd = 0.0,
+                        usageSummary = res.message.take(195),
+                        source = "AUTO_TELEMETRY"
+                    )
+                }
+                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun setCircuitBreakerSafeMode(enable: Boolean, reason: String) {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val res = hardeningClient.toggleCircuitBreakerSafeMode(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken,
+                    enableSafeMode = enable,
+                    reason = reason
+                )
+                _statusBanner.value = res.message
+                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun clearSelfHealReport() {
+        _selfHealReport.value = null
+    }
+
+    fun runTermuxPresetCommand(
+        preset: TermuxPresetCommand,
+        workdir: String = ""
+    ) {
+        if (_isRunningTermuxCommand.value) return
+        viewModelScope.launch {
+            _isRunningTermuxCommand.value = true
+            try {
+                val creds = _credentials.value
+                val res = bridgeClient.executeTermuxSafeCommand(
+                    agentUrl = creds.termuxAgentUrl,
+                    bearerToken = creds.termuxAgentToken,
+                    preset = preset,
+                    workdir = workdir
+                )
+                _lastTermuxCommandResult.value = res
+                _statusBanner.value = res.summaryMessage
+                BackgroundSyncScheduler.triggerImmediateTermuxSync(applicationContext, currentUserId)
+            } finally {
+                _isRunningTermuxCommand.value = false
+            }
+        }
+    }
+
+    fun rerunFailedGitHubRun(runId: Long) {
+        viewModelScope.launch {
+            _isSelfHealing.value = true
+            try {
+                val creds = _credentials.value
+                val res = bridgeClient.rerunFailedGitHubWorkflow(
+                    pat = creds.githubPat,
+                    ownerRepo = creds.githubOwnerRepo,
+                    runId = runId
+                )
+                _selfHealReport.value = res.message
+                _statusBanner.value = res.message
+            } finally {
+                _isSelfHealing.value = false
+            }
+        }
+    }
+
+    fun diagnoseErrorAndSelfHeal(
+        errorLog: String,
+        repoOverride: String,
+        workflowFile: String,
+        runId: Long,
+        sendToEmailWorker: Boolean,
+        rerunWorkflow: Boolean,
+        retryCount: Int = 0
+    ) {
+        if (errorLog.isBlank() || _isSelfHealing.value) return
+        viewModelScope.launch {
+            _isSelfHealing.value = true
+            try {
+                val creds = _credentials.value
+                val effectiveRepo = repoOverride.ifBlank { creds.githubOwnerRepo }
+                val effectiveWorkflow = workflowFile.ifBlank { creds.githubWorkflowFile }
+
+                val prompt = buildString {
+                    appendLine("You are AntiGravity Self-Heal Engineer.")
+                    appendLine("Diagnose this Terraform / GitHub Actions / Cloud error concisely in Japanese.")
+                    appendLine("Output: 1) 原因要約, 2) 修正パッチ(HCL/YAML/CLI), 3) 再実行の注意点。")
+                    appendLine("Repo: $effectiveRepo | Workflow: $effectiveWorkflow | RunId: $runId")
+                    appendLine()
+                    append(errorLog.take(6000))
+                }
+
+                val aiDiagnosis = runCatching {
+                    withTimeout(45_000L) {
+                        chatModel.generateContent(prompt).text.orEmpty()
+                    }
+                }.getOrElse { err ->
+                    "Gemini 診断エラー: ${err.localizedMessage ?: "Timeout"}"
+                }
+
+                val reportLines = mutableListOf<String>()
+                reportLines.add("### Gemini エラー診断・修正案")
+                reportLines.add(aiDiagnosis.ifBlank { "診断出力が空でした。" })
+
+                if (sendToEmailWorker) {
+                    val emailRes = bridgeClient.triggerEmailSelfHealWorker(
+                        baseUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = fetchFirebaseIdToken(),
+                        recipientEmail = costConfigState.value.alertEmail.ifBlank { userEmail },
+                        ownerRepo = effectiveRepo,
+                        workflowFile = effectiveWorkflow,
+                        runId = runId,
+                        errorLog = errorLog,
+                        suggestedPatch = aiDiagnosis,
+                        retryCount = retryCount
+                    )
+                    reportLines.add("\n### Email Worker 連携")
+                    reportLines.add(emailRes.message)
+                }
+
+                if (rerunWorkflow) {
+                    val rerunRes = if (runId > 0L) {
+                        bridgeClient.rerunFailedGitHubWorkflow(
+                            pat = creds.githubPat,
+                            ownerRepo = effectiveRepo,
+                            runId = runId
+                        )
+                    } else {
+                        bridgeClient.dispatchGitHubWorkflow(
+                            pat = creds.githubPat,
+                            ownerRepo = effectiveRepo,
+                            workflowFile = effectiveWorkflow,
+                            inputs = mapOf(
+                                "triggered_by" to "antigravity-self-heal",
+                                "retry_count" to (retryCount + 1).toString()
+                            )
+                        )
+                    }
+                    reportLines.add("\n### ワークフロー再実行")
+                    reportLines.add(rerunRes.message)
+                }
+
+                _selfHealReport.value = reportLines.joinToString("\n")
+                _statusBanner.value = "エラー診断と自己修復フローを実行しました"
+            } finally {
+                _isSelfHealing.value = false
+            }
+        }
     }
 
     fun clearBanner() {

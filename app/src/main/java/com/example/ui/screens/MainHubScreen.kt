@@ -67,6 +67,7 @@ import androidx.credentials.CredentialManager
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.example.auth.signOutUser
+import com.example.ui.components.SelfHealDialog
 import com.example.ui.viewmodel.HubViewModel
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -104,6 +105,8 @@ fun MainHubScreen(
     var currentTab by rememberSaveable { mutableStateOf(HubTab.AGENT) }
     var statusSubTab by rememberSaveable { mutableStateOf(StatusSubTab.DASHBOARD) }
     var showSettingsScreen by rememberSaveable { mutableStateOf(false) }
+    var showSelfHealDialog by rememberSaveable { mutableStateOf(false) }
+    var selfHealPrefillLog by rememberSaveable { mutableStateOf<String?>(null) }
 
     val nodesState by viewModel.nodesState.collectAsStateWithLifecycle()
     val blueprintsState by viewModel.blueprintsState.collectAsStateWithLifecycle()
@@ -113,6 +116,16 @@ fun MainHubScreen(
     val aiState by viewModel.aiState.collectAsStateWithLifecycle()
     val inferenceTarget by viewModel.inferenceTarget.collectAsStateWithLifecycle()
     val attachedSources by viewModel.attachedSources.collectAsStateWithLifecycle()
+    val isCrawlingWeb by viewModel.isCrawlingWeb.collectAsStateWithLifecycle()
+    val lastCrawlPreview by viewModel.lastCrawlPreview.collectAsStateWithLifecycle()
+    val isSelfHealing by viewModel.isSelfHealing.collectAsStateWithLifecycle()
+    val selfHealReport by viewModel.selfHealReport.collectAsStateWithLifecycle()
+    val isRunningTermuxCommand by viewModel.isRunningTermuxCommand.collectAsStateWithLifecycle()
+    val lastTermuxCommandResult by viewModel.lastTermuxCommandResult.collectAsStateWithLifecycle()
+    val isOrchestrating by viewModel.isOrchestrating.collectAsStateWithLifecycle()
+    val lastOrchestrationResult by viewModel.lastOrchestrationResult.collectAsStateWithLifecycle()
+    val hardeningState by viewModel.hardeningState.collectAsStateWithLifecycle()
+    val isHardeningBusy by viewModel.isHardeningBusy.collectAsStateWithLifecycle()
     val credentials by viewModel.credentials.collectAsStateWithLifecycle()
     val vaultMetadata by viewModel.vaultMetadata.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
@@ -295,6 +308,10 @@ fun MainHubScreen(
                             inferenceTarget = inferenceTarget,
                             gc2223Endpoint = credentials.gc2223Endpoint,
                             attachedSources = attachedSources,
+                            isCrawlingWeb = isCrawlingWeb,
+                            lastCrawlPreview = lastCrawlPreview,
+                            onCrawlUrlOrDomain = viewModel::crawlDomainOrUrl,
+                            onAttachDeviceScreenshot = viewModel::attachDeviceScreenshotBitmap,
                             onAddSourceUris = viewModel::addAttachedUris,
                             onRemoveSource = viewModel::removeAttachedSource,
                             onSelectTarget = viewModel::setInferenceTarget,
@@ -336,10 +353,23 @@ fun MainHubScreen(
                                     snapshot = syncSnapshot,
                                     syncSettings = syncSettings,
                                     syncWorkState = syncWorkState,
+                                    isRunningTermuxCommand = isRunningTermuxCommand,
+                                    lastTermuxCommandResult = lastTermuxCommandResult,
+                                    onRunTermuxPreset = viewModel::runTermuxPresetCommand,
+                                    onEscalateTermuxErrorToSelfHeal = { errLog ->
+                                        viewModel.clearSelfHealReport()
+                                        selfHealPrefillLog = errLog
+                                        showSelfHealDialog = true
+                                    },
                                     onSyncNow = viewModel::triggerBackgroundSyncNow,
                                     onSyncTermuxNow = viewModel::triggerTermuxSyncNow,
                                     onToggleBackgroundSync = viewModel::setBackgroundSyncEnabled,
                                     onSelectIntervalMinutes = viewModel::setBackgroundSyncInterval,
+                                    onOpenSelfHeal = {
+                                        viewModel.clearSelfHealReport()
+                                        selfHealPrefillLog = null
+                                        showSelfHealDialog = true
+                                    },
                                     onOpenSettings = { showSettingsScreen = true }
                                 )
 
@@ -351,6 +381,11 @@ fun MainHubScreen(
                                     onVerifyCloudflare = viewModel::verifyCloudflareNode,
                                     onVerifyGitHub = { node -> viewModel.verifyOrDispatchGitHub(node, dispatch = false) },
                                     onDispatchGitHub = { node -> viewModel.verifyOrDispatchGitHub(node, dispatch = true) },
+                                    onOpenSelfHeal = {
+                                        viewModel.clearSelfHealReport()
+                                        selfHealPrefillLog = null
+                                        showSelfHealDialog = true
+                                    },
                                     onMarkNodeActive = viewModel::updateGcpOrTermuxStatus
                                 )
                             }
@@ -374,6 +409,21 @@ fun MainHubScreen(
                         )
 
                         HubTab.DEPLOY -> DeployKitScreen(
+                            isBusy = isBusyNodeAction,
+                            isOrchestrating = isOrchestrating,
+                            isHardeningBusy = isHardeningBusy,
+                            lastOrchestrationResult = lastOrchestrationResult,
+                            hardeningState = hardeningState,
+                            githubRepoConfigured = credentials.githubPat.isNotBlank() && credentials.githubOwnerRepo.contains("/"),
+                            onPushTemplateToGitHub = viewModel::pushTemplateToGitHub,
+                            onPushAllOrchestrationStack = viewModel::pushAllOrchestrationStackToGitHub,
+                            onDispatchTerraform = { action, env ->
+                                viewModel.dispatchTerraformRun(action = action, targetEnv = env)
+                            },
+                            onRunOrchestrationTask = viewModel::runOrchestrationTask,
+                            onRefreshHardening = viewModel::refreshHardeningState,
+                            onDecideApproval = viewModel::decideApproval,
+                            onToggleSafeMode = viewModel::setCircuitBreakerSafeMode,
                             onSaveTemplate = { tpl ->
                                 viewModel.saveBlueprint(
                                     title = tpl.title,
@@ -404,5 +454,30 @@ fun MainHubScreen(
                 }
             }
         }
+    }
+
+    if (showSelfHealDialog) {
+        SelfHealDialog(
+            defaultRepo = credentials.githubOwnerRepo.ifBlank { syncSnapshot.github.targetRepo },
+            defaultWorkflow = credentials.githubWorkflowFile,
+            defaultRunId = syncSnapshot.github.workflowRunId,
+            initialErrorLog = selfHealPrefillLog,
+            isSelfHealing = isSelfHealing,
+            selfHealReport = selfHealReport,
+            onDismiss = { showSelfHealDialog = false },
+            onRunSelfHeal = { errorLog, repo, workflow, runId, sendToEmail, rerun ->
+                viewModel.diagnoseErrorAndSelfHeal(
+                    errorLog = errorLog,
+                    repoOverride = repo,
+                    workflowFile = workflow,
+                    runId = runId,
+                    sendToEmailWorker = sendToEmail,
+                    rerunWorkflow = rerun
+                )
+            },
+            onQuickRerunOnly = { runId ->
+                viewModel.rerunFailedGitHubRun(runId)
+            }
+        )
     }
 }

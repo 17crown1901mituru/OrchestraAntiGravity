@@ -126,6 +126,8 @@ class GitHubActivityService(
             var wfStatus = ""
             var wfConclusion = ""
             var wfUpdatedAt = ""
+            var wfRunId = 0L
+            var wfRunUrl = ""
             var openPrCount = 0
             val recentCommits = mutableListOf<GitHubCommitSummary>()
             val recentEvents = mutableListOf<GitHubActivityEvent>()
@@ -144,6 +146,8 @@ class GitHubActivityService(
                                 wfStatus = latest.optString("status", "")
                                 wfConclusion = latest.optString("conclusion", "")
                                 wfUpdatedAt = latest.optString("updated_at", "")
+                                wfRunId = latest.optLong("id", 0L)
+                                wfRunUrl = latest.optString("html_url", "")
                             }
                         }
                     }
@@ -253,6 +257,8 @@ class GitHubActivityService(
                 workflowStatus = wfStatus,
                 workflowConclusion = wfConclusion,
                 workflowUpdatedAt = wfUpdatedAt,
+                workflowRunId = wfRunId,
+                workflowRunUrl = wfRunUrl,
                 recentRepos = recentRepos,
                 recentCommits = recentCommits,
                 recentEvents = recentEvents,

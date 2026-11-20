@@ -1,10 +1,17 @@
 package com.example.data
 
+import android.util.Base64
 import com.example.model.CloudflareSyncStatus
 import com.example.model.CloudflareWorkerSummary
+import com.example.model.EmailRouteTarget
 import com.example.model.GitHubSyncStatus
+import com.example.model.OrchestrationRunResult
+import com.example.model.OrchestrationTaskType
 import com.example.model.SyncHealthState
+import com.example.model.TerraformAction
 import com.example.model.TermuxAgentSyncStatus
+import com.example.model.TermuxCommandResult
+import com.example.model.TermuxPresetCommand
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -23,12 +30,15 @@ data class BridgeCallResult(
     val message: String
 )
 
-class CloudBridgeClient {
-    private val client = OkHttpClient.Builder()
+class CloudBridgeClient(
+    private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
-        .build()
+        .build(),
+    private val githubApiBaseUrl: String = "https://api.github.com"
+) {
+    private val cleanGithubApiBase = githubApiBaseUrl.trimEnd('/')
 
     private val localClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
@@ -232,20 +242,21 @@ class CloudBridgeClient {
         pat: String,
         ownerRepo: String,
         workflowFile: String,
-        ref: String = "main"
+        ref: String = "main",
+        inputs: Map<String, String> = mapOf("triggered_by" to "antigravity-android")
     ): BridgeCallResult = withContext(Dispatchers.IO) {
         if (pat.isBlank() || !ownerRepo.contains("/")) {
             return@withContext BridgeCallResult(false, 0, "Set GitHub PAT and owner/repo (e.g. user/repo) first.")
         }
         val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
         val cleanWorkflow = workflowFile.trim().ifBlank { "antigravity-deploy.yml" }
-        val url = "https://api.github.com/repos/$cleanRepo/actions/workflows/$cleanWorkflow/dispatches"
+        val url = "$cleanGithubApiBase/repos/$cleanRepo/actions/workflows/$cleanWorkflow/dispatches"
         try {
+            val inputsJson = JSONObject()
+            inputs.forEach { (k, v) -> inputsJson.put(k, v) }
             val bodyJson = JSONObject().apply {
                 put("ref", ref)
-                put("inputs", JSONObject().apply {
-                    put("triggered_by", "antigravity-android")
-                })
+                put("inputs", inputsJson)
             }.toString()
             val request = Request.Builder()
                 .url(url)
@@ -266,8 +277,290 @@ class CloudBridgeClient {
         }
     }
 
+    suspend fun dispatchTerraformWorkflow(
+        pat: String,
+        ownerRepo: String,
+        workflowFile: String = "antigravity-terraform.yml",
+        action: TerraformAction,
+        targetEnv: String = "dev",
+        ref: String = "main",
+        retryCount: Int = 0
+    ): BridgeCallResult = dispatchGitHubWorkflow(
+        pat = pat,
+        ownerRepo = ownerRepo,
+        workflowFile = workflowFile.ifBlank { "antigravity-terraform.yml" },
+        ref = ref,
+        inputs = mapOf(
+            "tf_action" to action.cliValue,
+            "target_env" to targetEnv.ifBlank { "dev" },
+            "triggered_by" to "antigravity-android",
+            "retry_count" to retryCount.toString()
+        )
+    )
+
+    suspend fun commitFileToGitHub(
+        pat: String,
+        ownerRepo: String,
+        filePath: String,
+        content: String,
+        commitMessage: String,
+        branch: String = "main"
+    ): BridgeCallResult = withContext(Dispatchers.IO) {
+        if (pat.isBlank() || !ownerRepo.contains("/")) {
+            return@withContext BridgeCallResult(false, 0, "GitHub PAT と owner/repo をセキュア設定で登録してください。")
+        }
+        val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
+        val cleanPath = filePath.trim().trimStart('/')
+        if (cleanPath.isBlank()) {
+            return@withContext BridgeCallResult(false, 0, "ファイルパスが空です。")
+        }
+        val url = "$cleanGithubApiBase/repos/$cleanRepo/contents/$cleanPath"
+        try {
+            var existingSha: String? = null
+            val getReq = Request.Builder()
+                .url("$url?ref=$branch")
+                .header("Authorization", "Bearer ${pat.trim()}")
+                .header("Accept", "application/vnd.github+json")
+                .get()
+                .build()
+            client.newCall(getReq).execute().use { getResp ->
+                if (getResp.isSuccessful) {
+                    val existingJson = runCatching { JSONObject(getResp.body?.string().orEmpty()) }.getOrNull()
+                    existingSha = existingJson?.optString("sha")?.takeIf { it.isNotBlank() }
+                }
+            }
+
+            val encodedContent = Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            val bodyJson = JSONObject().apply {
+                put("message", commitMessage)
+                put("content", encodedContent)
+                put("branch", branch)
+                if (!existingSha.isNullOrBlank()) {
+                    put("sha", existingSha)
+                }
+            }.toString()
+
+            val putReq = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer ${pat.trim()}")
+                .header("Accept", "application/vnd.github+json")
+                .put(bodyJson.toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(putReq).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (resp.isSuccessful) {
+                    val commitSha = runCatching {
+                        JSONObject(raw).optJSONObject("commit")?.optString("sha")?.take(7)
+                    }.getOrNull().orEmpty()
+                    BridgeCallResult(
+                        success = true,
+                        statusCode = resp.code,
+                        message = "GitHub Push 完了: $cleanPath ($branch ${if (commitSha.isNotBlank()) commitSha else ""})".trim()
+                    )
+                } else {
+                    BridgeCallResult(false, resp.code, "GitHub Push HTTP ${resp.code}: ${raw.take(220)}")
+                }
+            }
+        } catch (e: Exception) {
+            BridgeCallResult(false, 0, e.localizedMessage ?: "GitHub file commit failed")
+        }
+    }
+
+    suspend fun rerunFailedGitHubWorkflow(
+        pat: String,
+        ownerRepo: String,
+        runId: Long
+    ): BridgeCallResult = withContext(Dispatchers.IO) {
+        if (pat.isBlank() || !ownerRepo.contains("/") || runId <= 0L) {
+            return@withContext BridgeCallResult(false, 0, "有効な Run ID・GitHub PAT・owner/repo が必要です。")
+        }
+        val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
+        val rerunFailedUrl = "$cleanGithubApiBase/repos/$cleanRepo/actions/runs/$runId/rerun-failed-jobs"
+        try {
+            val req = Request.Builder()
+                .url(rerunFailedUrl)
+                .header("Authorization", "Bearer ${pat.trim()}")
+                .header("Accept", "application/vnd.github+json")
+                .post("".toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.code == 201 || resp.isSuccessful) {
+                    return@withContext BridgeCallResult(true, resp.code, "失敗ジョブ (Run #$runId) の再実行を開始しました")
+                }
+                val err = resp.body?.string().orEmpty().take(200)
+                BridgeCallResult(false, resp.code, "再実行 HTTP ${resp.code}: ${err.ifBlank { resp.message }}")
+            }
+        } catch (e: Exception) {
+            BridgeCallResult(false, 0, e.localizedMessage ?: "Workflow rerun failed")
+        }
+    }
+
+    suspend fun triggerEmailSelfHealWorker(
+        baseUrl: String,
+        bearerToken: String,
+        firebaseIdToken: String?,
+        recipientEmail: String,
+        ownerRepo: String,
+        workflowFile: String,
+        runId: Long,
+        errorLog: String,
+        suggestedPatch: String,
+        retryCount: Int
+    ): BridgeCallResult = withContext(Dispatchers.IO) {
+        val cleanBase = normalizeBaseUrl(baseUrl)
+        val url = "$cleanBase/v1/workflow-error"
+        try {
+            val payload = JSONObject().apply {
+                put("recipientEmail", recipientEmail)
+                put("repo", ownerRepo)
+                put("workflow", workflowFile)
+                put("runId", runId)
+                put("errorLog", errorLog.take(6000))
+                put("suggestedPatch", suggestedPatch.take(6000))
+                put("retryCount", retryCount)
+                put("source", "antigravity-android")
+            }.toString()
+
+            val builder = Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody(jsonMediaType))
+            if (bearerToken.isNotBlank()) {
+                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
+            }
+            if (!firebaseIdToken.isNullOrBlank()) {
+                builder.header("X-Firebase-Token", firebaseIdToken)
+            }
+
+            client.newCall(builder.build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty().take(260)
+                BridgeCallResult(
+                    success = resp.isSuccessful,
+                    statusCode = resp.code,
+                    message = if (resp.isSuccessful) {
+                        "Email Worker 自己修復送信完了 (HTTP ${resp.code}): ${raw.ifBlank { "Queued" }}"
+                    } else {
+                        "Email Worker HTTP ${resp.code}: ${raw.ifBlank { resp.message }}"
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            BridgeCallResult(false, 0, e.localizedMessage ?: "Email Worker endpoint unreachable")
+        }
+    }
+
+    suspend fun triggerOrchestrationTask(
+        baseUrl: String,
+        bearerToken: String,
+        firebaseIdToken: String?,
+        routeTarget: EmailRouteTarget,
+        taskType: OrchestrationTaskType,
+        ownerRepo: String,
+        promptOrInput: String,
+        targetEnv: String = "dev",
+        termuxPreset: TermuxPresetCommand = TermuxPresetCommand.GIT_PULL
+    ): OrchestrationRunResult = withContext(Dispatchers.IO) {
+        val cleanBase = normalizeBaseUrl(baseUrl)
+        val url = "$cleanBase/v1/orchestrate"
+        val traceId = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+        try {
+            val innerPayload = JSONObject().apply {
+                put("prompt", promptOrInput.trim())
+                put("targetEnv", targetEnv.ifBlank { "dev" })
+                put("preset", termuxPreset.presetId)
+                if (promptOrInput.contains("http") || promptOrInput.contains(".")) {
+                    put("url", promptOrInput.trim())
+                }
+            }
+            val payload = JSONObject().apply {
+                put("traceId", traceId)
+                put("taskType", taskType.taskId)
+                put("routeAddress", routeTarget.address)
+                put("repo", ownerRepo.trim())
+                put("payload", innerPayload)
+            }.toString()
+
+            val builder = Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody(jsonMediaType))
+            if (bearerToken.isNotBlank()) {
+                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
+            }
+            if (!firebaseIdToken.isNullOrBlank()) {
+                builder.header("X-Firebase-Token", firebaseIdToken)
+            }
+
+            client.newCall(builder.build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                val ok = resp.isSuccessful && (json?.optBoolean("ok", true) == true)
+                val returnedTraceId = json?.optString("traceId").orEmpty().ifBlank { traceId }
+                val detail = json?.optString("detail").orEmpty().ifBlank { raw.take(600) }
+                val summary = if (ok) {
+                    "${routeTarget.address} -> ${taskType.label} 実行完了 (HTTP ${resp.code})"
+                } else {
+                    val hint = if (resp.code == 404) {
+                        "（Deploy Kit から worker/src/worker.js を Push・デプロイしてください）"
+                    } else ""
+                    "オーケストレーション HTTP ${resp.code}: ${detail.take(160)}$hint"
+                }
+                OrchestrationRunResult(
+                    success = ok,
+                    routeAddress = routeTarget.address,
+                    taskId = taskType.taskId,
+                    statusCode = resp.code,
+                    summary = summary,
+                    detail = detail,
+                    traceId = returnedTraceId
+                )
+            }
+        } catch (e: Exception) {
+            OrchestrationRunResult(
+                success = false,
+                routeAddress = routeTarget.address,
+                taskId = taskType.taskId,
+                statusCode = 0,
+                summary = e.localizedMessage ?: "オーケストレーション接続失敗",
+                detail = e.localizedMessage.orEmpty(),
+                traceId = traceId
+            )
+        }
+    }
+
+    suspend fun fetchPendingTermuxQueueTask(
+        baseUrl: String,
+        bearerToken: String,
+        firebaseIdToken: String?
+    ): BridgeCallResult = withContext(Dispatchers.IO) {
+        val cleanBase = normalizeBaseUrl(baseUrl)
+        val url = "$cleanBase/v1/termux/next-task"
+        try {
+            val builder = Request.Builder().url(url).get()
+            if (bearerToken.isNotBlank()) {
+                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
+            }
+            if (!firebaseIdToken.isNullOrBlank()) {
+                builder.header("X-Firebase-Token", firebaseIdToken)
+            }
+            client.newCall(builder.build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                val hasTask = json?.optBoolean("hasTask", false) == true
+                val preset = json?.optJSONObject("task")?.optString("preset").orEmpty()
+                val msg = when {
+                    !resp.isSuccessful -> "Termux キュー確認 HTTP ${resp.code}: ${raw.take(120)}"
+                    hasTask -> "保留タスクあり: preset=$preset（Termux で `antigravity pull-task` 実行可）"
+                    else -> "Cloudflare KV キューに保留中の Termux タスクはありません"
+                }
+                BridgeCallResult(resp.isSuccessful, resp.code, msg)
+            }
+        } catch (e: Exception) {
+            BridgeCallResult(false, 0, e.localizedMessage ?: "Termux queue check failed")
+        }
+    }
+
     private val gitHubActivityService by lazy {
-        GitHubActivityService(client = client)
+        GitHubActivityService(client = client, apiBaseUrl = cleanGithubApiBase)
     }
 
     suspend fun fetchGitHubSyncStatus(
@@ -505,6 +798,82 @@ class CloudBridgeClient {
                 daemonState = "ERROR",
                 latencyMs = latency,
                 summaryMessage = e.localizedMessage ?: "Termux ステータス取得失敗"
+            )
+        }
+    }
+
+    suspend fun executeTermuxSafeCommand(
+        agentUrl: String,
+        bearerToken: String = "",
+        preset: TermuxPresetCommand,
+        workdir: String = ""
+    ): TermuxCommandResult = withContext(Dispatchers.IO) {
+        val cleanBase = normalizeLocalAgentUrl(agentUrl)
+        val execClient = localClient.newBuilder()
+            .readTimeout(190, TimeUnit.SECONDS)
+            .build()
+        try {
+            val bodyJson = JSONObject().apply {
+                put("preset", preset.presetId)
+                if (workdir.isNotBlank()) put("workdir", workdir.trim())
+            }.toString()
+
+            val builder = Request.Builder()
+                .url("$cleanBase/run")
+                .post(bodyJson.toRequestBody(jsonMediaType))
+            if (bearerToken.isNotBlank()) {
+                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
+            }
+
+            execClient.newCall(builder.build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                if (!resp.isSuccessful && json == null) {
+                    return@withContext TermuxCommandResult(
+                        success = false,
+                        presetId = preset.presetId,
+                        exitCode = 1,
+                        stderr = raw.take(400).ifBlank { "HTTP ${resp.code}" },
+                        summaryMessage = "Termux /run HTTP ${resp.code}: ${raw.take(160)}"
+                    )
+                }
+                val ok = json?.optBoolean("ok", resp.isSuccessful) ?: resp.isSuccessful
+                val exitCode = json?.optInt("exitCode", if (ok) 0 else 1) ?: if (ok) 0 else 1
+                val stdout = json?.optString("stdout").orEmpty()
+                val stderr = json?.optString("stderr").orEmpty().ifBlank {
+                    json?.optString("error").orEmpty()
+                }
+                val durMs = json?.optLong("durationMs", 0L) ?: 0L
+                val summary = if (ok) {
+                    "${preset.label} 完了 (exit $exitCode, ${durMs}ms)"
+                } else {
+                    "${preset.label} エラー (exit $exitCode): ${stderr.lineSequence().firstOrNull().orEmpty().take(120)}"
+                }
+                TermuxCommandResult(
+                    success = ok,
+                    presetId = preset.presetId,
+                    exitCode = exitCode,
+                    stdout = stdout,
+                    stderr = stderr,
+                    durationMs = durMs,
+                    summaryMessage = summary
+                )
+            }
+        } catch (e: ConnectException) {
+            TermuxCommandResult(
+                success = false,
+                presetId = preset.presetId,
+                exitCode = 1,
+                stderr = "Termux 未起動 ($cleanBase)",
+                summaryMessage = "Termux で `antigravity serve` を起動してください ($cleanBase)"
+            )
+        } catch (e: Exception) {
+            TermuxCommandResult(
+                success = false,
+                presetId = preset.presetId,
+                exitCode = 1,
+                stderr = e.localizedMessage ?: "Termux /run failed",
+                summaryMessage = e.localizedMessage ?: "Termux ローカル実行に失敗しました"
             )
         }
     }

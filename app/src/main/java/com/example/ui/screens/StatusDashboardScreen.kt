@@ -17,7 +17,9 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.CloudOff
@@ -25,11 +27,13 @@ import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Key
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -39,11 +43,16 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -58,6 +67,8 @@ import com.example.model.GitHubSyncStatus
 import com.example.model.SyncHealthState
 import com.example.model.SyncStatusSnapshot
 import com.example.model.TermuxAgentSyncStatus
+import com.example.model.TermuxCommandResult
+import com.example.model.TermuxPresetCommand
 import com.example.sync.SyncWorkUiState
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -68,10 +79,15 @@ fun StatusDashboardScreen(
     snapshot: SyncStatusSnapshot,
     syncSettings: BackgroundSyncSettings,
     syncWorkState: SyncWorkUiState,
+    isRunningTermuxCommand: Boolean = false,
+    lastTermuxCommandResult: TermuxCommandResult? = null,
+    onRunTermuxPreset: (TermuxPresetCommand, String) -> Unit = { _, _ -> },
+    onEscalateTermuxErrorToSelfHeal: (String) -> Unit = {},
     onSyncNow: () -> Unit,
     onSyncTermuxNow: () -> Unit,
     onToggleBackgroundSync: (Boolean) -> Unit,
     onSelectIntervalMinutes: (Long) -> Unit,
+    onOpenSelfHeal: () -> Unit = {},
     onOpenSettings: () -> Unit
 ) {
     val lastSyncedLabel = remember(snapshot.syncedAtEpochMs) {
@@ -122,6 +138,10 @@ fun StatusDashboardScreen(
                     lastSyncedEpochMs = snapshot.termuxSyncedAtEpochMs,
                     triggerSource = snapshot.termuxTriggerSource,
                     isSyncingTermux = syncWorkState.isTermuxSyncingNow,
+                    isRunningTermuxCommand = isRunningTermuxCommand,
+                    lastCommandResult = lastTermuxCommandResult,
+                    onRunTermuxPreset = onRunTermuxPreset,
+                    onEscalateTermuxErrorToSelfHeal = onEscalateTermuxErrorToSelfHeal,
                     onSyncTermuxNow = onSyncTermuxNow,
                     onOpenSettings = onOpenSettings
                 )
@@ -131,6 +151,7 @@ fun StatusDashboardScreen(
             item {
                 GitHubStatusCard(
                     github = snapshot.github,
+                    onOpenSelfHeal = onOpenSelfHeal,
                     onOpenSettings = onOpenSettings
                 )
             }
@@ -335,6 +356,10 @@ private fun TermuxStatusCard(
     lastSyncedEpochMs: Long,
     triggerSource: String,
     isSyncingTermux: Boolean,
+    isRunningTermuxCommand: Boolean,
+    lastCommandResult: TermuxCommandResult?,
+    onRunTermuxPreset: (TermuxPresetCommand, String) -> Unit,
+    onEscalateTermuxErrorToSelfHeal: (String) -> Unit,
     onSyncTermuxNow: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -342,6 +367,7 @@ private fun TermuxStatusCard(
     val lastTermuxLabel = remember(lastSyncedEpochMs) {
         formatEpochMs(lastSyncedEpochMs, emptyText = "未取得")
     }
+    var termuxWorkdir by rememberSaveable { mutableStateOf("") }
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -464,6 +490,103 @@ private fun TermuxStatusCard(
                 )
             }
 
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "ローカル CLI 安全実行ブリッジ (POST /run)",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                OutlinedTextField(
+                    value = termuxWorkdir,
+                    onValueChange = { termuxWorkdir = it },
+                    label = { Text("作業ディレクトリ (任意・例: ~/OrchestraAntiGravity)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("termux_workdir_input"),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TermuxPresetCommand.entries.forEach { preset ->
+                        AssistChip(
+                            onClick = { onRunTermuxPreset(preset, termuxWorkdir) },
+                            enabled = !isRunningTermuxCommand,
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            label = { Text(preset.label) },
+                            modifier = Modifier.testTag("termux_run_${preset.presetId}")
+                        )
+                    }
+                }
+                if (isRunningTermuxCommand) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                if (lastCommandResult != null) {
+                    val outText = buildString {
+                        appendLine(lastCommandResult.summaryMessage)
+                        if (lastCommandResult.stdout.isNotBlank()) {
+                            appendLine("--- stdout ---")
+                            appendLine(lastCommandResult.stdout.take(800))
+                        }
+                        if (lastCommandResult.stderr.isNotBlank()) {
+                            appendLine("--- stderr ---")
+                            appendLine(lastCommandResult.stderr.take(800))
+                        }
+                    }.trim()
+                    Surface(
+                        color = if (lastCommandResult.success) {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        } else {
+                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("termux_command_output_box")
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = outText,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                    if (!lastCommandResult.success) {
+                        OutlinedButton(
+                            onClick = {
+                                val combinedErr = buildString {
+                                    appendLine("Termux preset failed: ${lastCommandResult.presetId} (exit ${lastCommandResult.exitCode})")
+                                    if (lastCommandResult.stderr.isNotBlank()) appendLine(lastCommandResult.stderr)
+                                    if (lastCommandResult.stdout.isNotBlank()) appendLine(lastCommandResult.stdout)
+                                }
+                                onEscalateTermuxErrorToSelfHeal(combinedErr)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("escalate_termux_error_button")
+                        ) {
+                            Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("この失敗ログを Self-Heal へ送信")
+                        }
+                    }
+                }
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -498,6 +621,7 @@ private fun TermuxStatusCard(
 @Composable
 private fun GitHubStatusCard(
     github: GitHubSyncStatus,
+    onOpenSelfHeal: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val (badgeColor, badgeIcon) = healthVisuals(github.health)
@@ -686,6 +810,24 @@ private fun GitHubStatusCard(
                         .height(48.dp)
                 ) {
                     Text("セキュア設定で GitHub PAT を登録")
+                }
+            } else {
+                OutlinedButton(
+                    onClick = onOpenSelfHeal,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("open_self_heal_button")
+                ) {
+                    Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        if (github.workflowConclusion.equals("failure", ignoreCase = true)) {
+                            "失敗を Email Worker で自己修復・再実行"
+                        } else {
+                            "Email Worker 自己修復 & 再実行コンソール"
+                        }
+                    )
                 }
             }
         }

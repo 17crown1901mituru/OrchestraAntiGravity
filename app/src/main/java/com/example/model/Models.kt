@@ -199,6 +199,8 @@ data class GitHubSyncStatus(
     val workflowStatus: String = "",
     val workflowConclusion: String = "",
     val workflowUpdatedAt: String = "",
+    val workflowRunId: Long = 0L,
+    val workflowRunUrl: String = "",
     val recentRepos: List<GitHubRepoSummary> = emptyList(),
     val recentCommits: List<GitHubCommitSummary> = emptyList(),
     val recentEvents: List<GitHubActivityEvent> = emptyList(),
@@ -255,5 +257,139 @@ data class SyncStatusSnapshot(
 data class BackgroundSyncSettings(
     val enabled: Boolean = true,
     val intervalMinutes: Long = 15L
+)
+
+enum class DeviceViewportProfile(
+    val label: String,
+    val widthDp: Int,
+    val heightDp: Int,
+    val userAgent: String
+) {
+    PIXEL_9_PRO(
+        label = "Pixel 9 Pro",
+        widthDp = 412,
+        heightDp = 915,
+        userAgent = "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+    ),
+    GALAXY_S25_ULTRA(
+        label = "Galaxy S25 Ultra",
+        widthDp = 412,
+        heightDp = 915,
+        userAgent = "Mozilla/5.0 (Linux; Android 15; SM-S938B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+    ),
+    IPHONE_16_PRO(
+        label = "iPhone 16 Pro",
+        widthDp = 393,
+        heightDp = 852,
+        userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
+    ),
+    FOLDABLE_UNFOLDED(
+        label = "Foldable 展開",
+        widthDp = 840,
+        heightDp = 900,
+        userAgent = "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Fold) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    )
+}
+
+enum class CrawlMode(val label: String) {
+    SINGLE_URL("単一URL"),
+    DOMAIN_CRAWL("ドメイン巡回")
+}
+
+data class WebCrawlPreview(
+    val targetUrl: String,
+    val pageCount: Int,
+    val deviceProfileLabel: String,
+    val summarySnippet: String,
+    val attachedFileName: String,
+    val hasScreenshot: Boolean = false
+)
+
+enum class TerraformAction(val cliValue: String, val label: String) {
+    PLAN("plan", "terraform plan"),
+    APPLY("apply", "terraform apply"),
+    DESTROY("destroy", "terraform destroy")
+}
+
+enum class TermuxPresetCommand(val presetId: String, val label: String) {
+    ANTIGRAVITY_HEALTH("antigravity_health", "GW 疎通"),
+    GIT_PULL("git_pull", "git pull"),
+    TF_PLAN("tf_plan", "TF Plan"),
+    TF_APPLY("tf_apply", "TF Apply"),
+    WRANGLER_DEPLOY("wrangler_deploy", "Wrangler")
+}
+
+data class TermuxCommandResult(
+    val success: Boolean,
+    val presetId: String,
+    val exitCode: Int,
+    val stdout: String = "",
+    val stderr: String = "",
+    val durationMs: Long = 0L,
+    val summaryMessage: String = ""
+)
+
+enum class EmailRouteTarget(val localPart: String, val address: String, val label: String) {
+    TASK("task", "task@gc2223.com", "AIタスク実行 (task@)"),
+    TERRAFORM("tf", "tf@gc2223.com", "Terraform実行 (tf@)"),
+    CI_HEAL("ci-heal", "ci-heal@gc2223.com", "自己修復 (ci-heal@)"),
+    CRAWL("crawl", "crawl@gc2223.com", "URL調査 (crawl@)")
+}
+
+enum class OrchestrationTaskType(val taskId: String, val label: String) {
+    AI_TASK_ROUTER("ai_task_router", "AI自律ルーティング"),
+    TF_PLAN("tf_plan", "Terraform Plan"),
+    TF_APPLY("tf_apply", "Terraform Apply"),
+    DISPATCH_GITHUB("dispatch_github", "GitHub Actions起動"),
+    QUEUE_TERMUX("queue_termux", "Termux Pull キュー投入"),
+    CRAWL_ANALYZE("crawl_analyze", "URLクロール解析")
+}
+
+data class OrchestrationRunResult(
+    val success: Boolean,
+    val routeAddress: String,
+    val taskId: String,
+    val statusCode: Int,
+    val summary: String,
+    val detail: String = "",
+    val traceId: String = ""
+)
+
+data class PendingApprovalItem(
+    val approvalId: String,
+    val action: String,
+    val repo: String = "",
+    val targetEnv: String = "dev",
+    val summary: String = "",
+    val traceId: String = "",
+    val expiresAtMs: Long = 0L
+)
+
+data class AuditTraceEntry(
+    val traceId: String,
+    val source: String,
+    val taskType: String,
+    val ok: Boolean,
+    val summary: String,
+    val timestamp: String
+)
+
+data class OrchestrationHardeningState(
+    val safeMode: Boolean = false,
+    val safeReason: String = "",
+    val aiHourCount: Int = 0,
+    val ghHourCount: Int = 0,
+    val dlqCount: Int = 0,
+    val approvalsCount: Int = 0,
+    val termuxBatteryPct: Int? = null,
+    val termuxCharging: Boolean? = null,
+    val termuxNetwork: String = "",
+    val termuxLastSeen: String = "",
+    val cronLastAt: String = "",
+    val cronLastConclusion: String = "",
+    val patExpiryWarning: String = "",
+    val approvals: List<PendingApprovalItem> = emptyList(),
+    val recentAuditLogs: List<AuditTraceEntry> = emptyList(),
+    val statusMessage: String = ""
 )
 
