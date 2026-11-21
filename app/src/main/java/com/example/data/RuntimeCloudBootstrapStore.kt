@@ -226,6 +226,20 @@ class RuntimeCloudBootstrapStore(context: Context) {
                     }
                 }
             }
+            if (webClientId.isBlank()) {
+                val otherClients = chosen.optJSONObject("services")
+                    ?.optJSONObject("appinvite_service")
+                    ?.optJSONArray("other_platform_oauth_client")
+                if (otherClients != null) {
+                    for (i in 0 until otherClients.length()) {
+                        val oauth = otherClients.optJSONObject(i) ?: continue
+                        if (oauth.optInt("client_type", 0) == 3) {
+                            webClientId = oauth.optString("client_id", "").trim()
+                            if (webClientId.isNotBlank()) break
+                        }
+                    }
+                }
+            }
 
             require(projectId.isNotBlank() && appId.isNotBlank() && apiKey.isNotBlank()) {
                 "project_id / mobilesdk_app_id / current_key を読み取れませんでした"

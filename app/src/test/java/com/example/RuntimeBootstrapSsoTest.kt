@@ -89,6 +89,38 @@ class RuntimeBootstrapSsoTest {
 
         store.clear()
         assertFalse(store.load().hasFirebaseRuntimeParams())
+
+        val appInviteFallbackJson = """
+            {
+              "project_info": { "project_id": "fallback-proj" },
+              "client": [
+                {
+                  "client_info": {
+                    "mobilesdk_app_id": "1:555:android:777",
+                    "android_client_info": { "package_name": "com.example.target" }
+                  },
+                  "oauth_client": [],
+                  "api_key": [{ "current_key": "AIzaFallbackKey" }],
+                  "services": {
+                    "appinvite_service": {
+                      "other_platform_oauth_client": [
+                        { "client_id": "555-other.apps.googleusercontent.com", "client_type": 3 }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        val fallbackParsed = RuntimeCloudBootstrapStore.parseGoogleServicesJson(
+            rawJson = appInviteFallbackJson,
+            targetPackageName = "com.example.target"
+        )
+        assertTrue(fallbackParsed.isSuccess)
+        assertEquals(
+            "555-other.apps.googleusercontent.com",
+            fallbackParsed.getOrThrow().firebaseWebClientId
+        )
     }
 
     @Test

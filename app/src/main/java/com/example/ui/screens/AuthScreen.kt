@@ -62,20 +62,27 @@ import androidx.lifecycle.lifecycleScope
 import com.example.R
 import com.example.auth.attemptAutoSignIn
 import com.example.auth.onGoogleSignInClicked
+import com.example.auth.resolveDefaultWebClientId
+import com.example.data.CloudBridgeClient
 import com.example.data.RuntimeCloudBootstrapStore
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AuthScreen(
     onAuthSuccess: () -> Unit,
-    onOpenRuntimeConfig: () -> Unit = {}
+    isFirebaseReady: Boolean = true,
+    onFirebaseInitialized: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val fallbackScope = rememberCoroutineScope()
     val authScope = (context as? ComponentActivity)?.lifecycleScope ?: fallbackScope
     val credentialManager = remember(context) { CredentialManager.create(context) }
-    val bootstrapConfig = remember(context) { RuntimeCloudBootstrapStore(context).load() }
+    val bootstrapStore = remember(context) { RuntimeCloudBootstrapStore(context) }
+    val bridgeClient = remember { CloudBridgeClient() }
+
+    var bootstrapConfig by remember(context) { mutableStateOf(bootstrapStore.load()) }
     val workerLabel = remember(bootstrapConfig.gatewayUrl) {
         bootstrapConfig.gatewayUrl
             .removePrefix("https://")
@@ -86,17 +93,53 @@ fun AuthScreen(
 
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var showBootstrapDialog by remember { mutableStateOf(false) }
+    var bootstrapNotice by remember { mutableStateOf<String?>(null) }
+    var pendingSignInAfterBootstrap by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        // Let the initial Compose frame commit cleanly before starting Credential Manager check
-        delay(120L)
-        attemptAutoSignIn(
+    fun launchGoogleSignIn() {
+        errorMessage = null
+        isLoading = true
+        onGoogleSignInClicked(
             context = context,
             credentialManager = credentialManager,
-            onAuthSuccess = onAuthSuccess,
-            onUnauthenticated = {},
-            scope = authScope
+            onAuthSuccess = {
+                isLoading = false
+                onAuthSuccess()
+            },
+            onAuthError = { msg ->
+                isLoading = false
+                errorMessage = msg
+            },
+            scope = authScope,
+            onAuthCancelled = {
+                isLoading = false
+            }
         )
+    }
+
+    LaunchedEffect(isFirebaseReady) {
+        // Let initial Compose frame commit cleanly
+        delay(120L)
+        if (isFirebaseReady && resolveDefaultWebClientId(context) != null) {
+            attemptAutoSignIn(
+                context = context,
+                credentialManager = credentialManager,
+                onAuthSuccess = onAuthSuccess,
+                onUnauthenticated = {},
+                scope = authScope
+            )
+        } else {
+            // Silently attempt runtime bootstrap in background without showing error banners on launch
+            val targetGateway = bootstrapConfig.gatewayUrl.ifBlank { "https://gc2223.com" }
+            bridgeClient.fetchClientBootstrapConfig(targetGateway).onSuccess { cfg ->
+                bootstrapStore.save(cfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
+                bootstrapConfig = bootstrapStore.load()
+                if (RuntimeCloudBootstrapStore.ensureFirebaseInitialized(context)) {
+                    onFirebaseInitialized()
+                }
+            }
+        }
     }
 
     Box(
@@ -219,24 +262,43 @@ fun AuthScreen(
 
             Button(
                 onClick = {
-                    errorMessage = null
-                    isLoading = true
-                    onGoogleSignInClicked(
-                        context = context,
-                        credentialManager = credentialManager,
-                        onAuthSuccess = {
-                            isLoading = false
-                            onAuthSuccess()
-                        },
-                        onAuthError = { msg ->
-                            isLoading = false
-                            errorMessage = msg
-                        },
-                        scope = authScope,
-                        onAuthCancelled = {
-                            isLoading = false
+                    val readyNow = (isFirebaseReady || RuntimeCloudBootstrapStore.ensureFirebaseInitialized(context)) &&
+                        resolveDefaultWebClientId(context) != null
+                    if (readyNow) {
+                        onFirebaseInitialized()
+                        launchGoogleSignIn()
+                    } else {
+                        errorMessage = null
+                        isLoading = true
+                        authScope.launch {
+                            val targetGateway = bootstrapConfig.gatewayUrl.ifBlank { "https://gc2223.com" }
+                            val res = bridgeClient.fetchClientBootstrapConfig(targetGateway)
+                            res.onSuccess { cfg ->
+                                bootstrapStore.save(cfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
+                                bootstrapConfig = bootstrapStore.load()
+                                val inited = RuntimeCloudBootstrapStore.ensureFirebaseInitialized(context)
+                                if (inited && resolveDefaultWebClientId(context) != null) {
+                                    onFirebaseInitialized()
+                                    launchGoogleSignIn()
+                                } else {
+                                    isLoading = false
+                                    bootstrapNotice = "Gateway から一部項目を取得しましたが Web Client ID が不足しています。google-services.json を選択または入力してください。"
+                                    pendingSignInAfterBootstrap = true
+                                    showBootstrapDialog = true
+                                }
+                            }.onFailure { err ->
+                                isLoading = false
+                                val rawMsg = err.localizedMessage.orEmpty()
+                                bootstrapNotice = if (rawMsg.contains("404")) {
+                                    "この APK は秘密情報未埋め込みビルドで、Gateway ($targetGateway/v1/client-config) もまだ更新前 (404) です。端末内の google-services.json を選択するとすぐ Google ログインを開始できます。"
+                                } else {
+                                    "Gateway ($targetGateway) から自動設定を取得できなかったため、端末内の google-services.json を選択するか接続先を指定してください。"
+                                }
+                                pendingSignInAfterBootstrap = true
+                                showBootstrapDialog = true
+                            }
                         }
-                    )
+                    }
                 },
                 enabled = !isLoading,
                 modifier = Modifier
@@ -264,7 +326,11 @@ fun AuthScreen(
             }
 
             OutlinedButton(
-                onClick = onOpenRuntimeConfig,
+                onClick = {
+                    bootstrapNotice = null
+                    pendingSignInAfterBootstrap = false
+                    showBootstrapDialog = true
+                },
                 enabled = !isLoading,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -278,7 +344,7 @@ fun AuthScreen(
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("接続先 / Firebase 設定を変更 (Gateway URL)")
+                Text("接続先 / google-services.json 設定")
             }
 
             Text(
@@ -287,6 +353,25 @@ fun AuthScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (showBootstrapDialog) {
+        RuntimeBootstrapDialog(
+            initialNotice = bootstrapNotice,
+            onDismiss = {
+                showBootstrapDialog = false
+                pendingSignInAfterBootstrap = false
+            },
+            onBootstrapped = { updatedCfg ->
+                bootstrapConfig = updatedCfg
+                showBootstrapDialog = false
+                onFirebaseInitialized()
+                if (pendingSignInAfterBootstrap) {
+                    pendingSignInAfterBootstrap = false
+                    launchGoogleSignIn()
+                }
+            }
+        )
     }
 }
 
