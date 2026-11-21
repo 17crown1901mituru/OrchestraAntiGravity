@@ -1,6 +1,9 @@
 package com.example.ui.components
 
 import android.Manifest
+import android.app.StatusBarManager
+import android.content.ComponentName
+import android.graphics.drawable.Icon as AndroidIcon
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,8 +22,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.Backup
 import androidx.compose.material.icons.rounded.DevicesOther
+import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.MonitorHeart
 import androidx.compose.material.icons.rounded.NotificationsActive
+import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -40,7 +45,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.R
 import com.example.model.OrchestrationHardeningState
+import com.example.sync.KillSwitchTileService
 import com.example.sync.UrgentAlertNotifier
 
 @Composable
@@ -51,7 +58,9 @@ fun ResilienceOperationsCard(
     onTriggerAutoTune: () -> Unit,
     onCreateDrSnapshot: () -> Unit,
     onRestoreDrSnapshot: () -> Unit,
-    onPingDeadmanSwitch: () -> Unit = {}
+    onPingDeadmanSwitch: () -> Unit = {},
+    onRegisterBiometricKey: () -> Unit = {},
+    onShowMessage: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var hasNotificationPermission by remember {
@@ -268,6 +277,59 @@ fun ResilienceOperationsCard(
                     Icon(Icons.Rounded.NotificationsActive, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("緊急プッシュ通知を許可", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+
+            // 5. Hardware Zero-Trust Key & Quick Settings Kill-Switch Tile
+            OutlinedButton(
+                onClick = onRegisterBiometricKey,
+                enabled = !isBusy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("register_biometric_key_button")
+            ) {
+                Icon(Icons.Rounded.Fingerprint, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (state.hardwareKeyRegistered) {
+                        "生体署名鍵を更新 (登録済: ${state.hardwareKeyId.take(8)})"
+                    } else {
+                        "生体署名鍵を登録 (StrongBox/TEE)"
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                OutlinedButton(
+                    onClick = {
+                        val sbm = context.getSystemService(StatusBarManager::class.java)
+                        sbm?.requestAddTileService(
+                            ComponentName(context, KillSwitchTileService::class.java),
+                            context.getString(R.string.qs_tile_killswitch_label),
+                            AndroidIcon.createWithResource(context, R.drawable.ic_launcher_foreground),
+                            context.mainExecutor
+                        ) { resultCode ->
+                            when (resultCode) {
+                                StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED ->
+                                    onShowMessage("クイック設定に Kill-Switch タイルを追加しました")
+                                StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED ->
+                                    onShowMessage("Kill-Switch タイルは既にクイック設定に追加済みです")
+                                else ->
+                                    onShowMessage("タイルの追加をスキップしました (code=$resultCode)")
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("add_killswitch_tile_button")
+                ) {
+                    Icon(Icons.Rounded.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("クイック設定キルスイッチを追加", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }

@@ -293,7 +293,8 @@ enum class DeviceViewportProfile(
 
 enum class CrawlMode(val label: String) {
     SINGLE_URL("単一URL"),
-    DOMAIN_CRAWL("ドメイン巡回")
+    DOMAIN_CRAWL("ドメイン巡回"),
+    PATH_RECURSIVE("PATH配下再帰(.md)")
 }
 
 data class WebCrawlPreview(
@@ -302,7 +303,9 @@ data class WebCrawlPreview(
     val deviceProfileLabel: String,
     val summarySnippet: String,
     val attachedFileName: String,
-    val hasScreenshot: Boolean = false
+    val hasScreenshot: Boolean = false,
+    val savedSessionDirName: String = "",
+    val languageSummary: String = ""
 )
 
 enum class TerraformAction(val cliValue: String, val label: String) {
@@ -367,7 +370,27 @@ data class PendingApprovalItem(
     val traceId: String = "",
     val expiresAtMs: Long = 0L,
     val aiConfidence: Double? = null,
-    val aiReasoning: String = ""
+    val aiReasoning: String = "",
+    val actionHash: String = "",
+    val criticWarnings: List<String> = emptyList(),
+    val criticRiskLevel: String = ""
+)
+
+data class AskRagCitation(
+    val traceId: String,
+    val source: String,
+    val summary: String,
+    val score: Double = 0.0
+)
+
+data class AskRagResult(
+    val ok: Boolean,
+    val question: String,
+    val answer: String,
+    val citations: List<AskRagCitation> = emptyList(),
+    val usedEmbeddings: Boolean = false,
+    val traceId: String = "",
+    val statusMessage: String = ""
 )
 
 data class AuditTraceEntry(
@@ -460,6 +483,17 @@ data class OrchestrationHardeningState(
     val goldenScorePct: Int = 100,
     val autoTuneBlockedByGolden: Boolean = false,
     val drKdfAlgorithm: String = "PBKDF2-SHA256",
+    val hardwareKeyRegistered: Boolean = false,
+    val hardwareKeyId: String = "",
+    val ciMinutesUsedMonth: Int = 0,
+    val ciMinutesLimit: Int = 2000,
+    val ciOffloadActive: Boolean = false,
+    val actualKvWrites: Int = 0,
+    val actualR2Ops: Int = 0,
+    val actualWorkerCpuMs: Int = 0,
+    val deltaKvWrites: Int = 0,
+    val telemetrySyncedAt: String = "",
+    val finopsBreakdown: Map<String, Int> = emptyMap(),
     val approvals: List<PendingApprovalItem> = emptyList(),
     val recentAuditLogs: List<AuditTraceEntry> = emptyList(),
     val statusMessage: String = ""

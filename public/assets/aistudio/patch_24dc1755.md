@@ -1,0 +1,88 @@
+# Method: projects.locations.quotaPreferences.patch &nbsp;|&nbsp; Cloud Quotas &nbsp;|&nbsp; Google Cloud Documentation
+URL: https://docs.cloud.google.com/docs/quotas/reference/rest/v1beta/projects.locations.quotaPreferences/patch
+
+*   [HTTP request](#body.HTTP_TEMPLATE)
+*   [Path parameters](#body.PATH_PARAMETERS)
+*   [Query parameters](#body.QUERY_PARAMETERS)
+*   [Request body](#body.request_body)
+*   [Response body](#body.response_body)
+*   [Authorization scopes](#body.aspect)
+*   [IAM Permissions](#body.aspect_1)
+*   [Try it!](#try-it)
+
+Updates the parameters of a single QuotaPreference. It can updates the config in any states, not just the ones pending approval.
+
+### HTTP request
+
+`PATCH https://cloudquotas.googleapis.com/v1beta/{quotaPreference.name=projects/*/locations/*/quotaPreferences/*}`
+
+The URL uses [gRPC Transcoding](https://google.aip.dev/127) syntax.
+
+### Path parameters
+
+ 
+| Parameters |
+| --- |
+| `quotaPreference.name` | 
+`string`
+
+Required except in the CREATE requests. The resource name of the quota preference. The path that follows `/locations` must be `/global`. For example: `projects/123/locations/global/quotaPreferences/my-config-for-us-east1`
+
+ |
+
+### Query parameters
+
+ 
+| Parameters |
+| --- |
+| `updateMask` | 
+``string (`[FieldMask](https://protobuf.dev/reference/protobuf/google.protobuf/#field-mask)` format)``
+
+Optional. Field mask is used to specify the fields to be overwritten in the QuotaPreference resource by the update. The fields specified in the updateMask are relative to the resource, not the full request. A field will be overwritten if it is in the mask. If the user does not provide a mask then all fields will be overwritten.
+
+This is a comma-separated list of fully qualified names of fields. Example: `"user.displayName,photo"`.
+
+ |
+| `allowMissing` | 
+
+`boolean`
+
+Optional. If set to true, and the quota preference is not found, a new one will be created. In this situation, `updateMask` is ignored.
+
+ |
+| `validateOnly` | 
+
+`boolean`
+
+Optional. If set to true, validate the request, but do not actually update. Note that a request being valid does not mean that the request is guaranteed to be fulfilled.
+
+ |
+| `ignoreSafetyChecks[]` | 
+
+``enum (`[QuotaSafetyCheck](https://docs.cloud.google.com/docs/quotas/reference/rest/v1beta/QuotaSafetyCheck)`)``
+
+The list of quota safety checks to be ignored.
+
+ |
+
+### Request body
+
+The request body contains an instance of `[QuotaPreference](https://docs.cloud.google.com/docs/quotas/reference/rest/v1beta/folders.locations.quotaPreferences#QuotaPreference)`.
+
+### Response body
+
+If successful, the response body contains an instance of `[QuotaPreference](https://docs.cloud.google.com/docs/quotas/reference/rest/v1beta/folders.locations.quotaPreferences#QuotaPreference)`.
+
+Requires the following OAuth scope:
+
+*   `https://www.googleapis.com/auth/cloud-platform`
+
+For more information, see the [Authentication Overview](https://docs.cloud.google.com/docs/authentication#authorization-gcp).
+
+### IAM Permissions
+
+Requires the following [IAM](https://cloud.google.com/iam/docs) permission on the `name` resource:
+
+*   `cloudquotas.quotas.update`
+
+For more information, see the [IAM documentation](https://cloud.google.com/iam/docs).

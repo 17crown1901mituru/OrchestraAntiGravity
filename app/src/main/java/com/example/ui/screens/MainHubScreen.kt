@@ -1,7 +1,10 @@
 package com.example.ui.screens
 
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -126,6 +129,9 @@ fun MainHubScreen(
     val lastOrchestrationResult by viewModel.lastOrchestrationResult.collectAsStateWithLifecycle()
     val hardeningState by viewModel.hardeningState.collectAsStateWithLifecycle()
     val isHardeningBusy by viewModel.isHardeningBusy.collectAsStateWithLifecycle()
+    val lastAskResult by viewModel.lastAskResult.collectAsStateWithLifecycle()
+    val isAskingRag by viewModel.isAskingRag.collectAsStateWithLifecycle()
+    val fragmentActivity = remember(context) { context.findFragmentActivity() }
     val credentials by viewModel.credentials.collectAsStateWithLifecycle()
     val vaultMetadata by viewModel.vaultMetadata.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
@@ -414,6 +420,8 @@ fun MainHubScreen(
                             isHardeningBusy = isHardeningBusy,
                             lastOrchestrationResult = lastOrchestrationResult,
                             hardeningState = hardeningState,
+                            lastAskResult = lastAskResult,
+                            isAskingRag = isAskingRag,
                             githubRepoConfigured = credentials.githubPat.isNotBlank() && credentials.githubOwnerRepo.contains("/"),
                             onPushTemplateToGitHub = viewModel::pushTemplateToGitHub,
                             onPushAllOrchestrationStack = viewModel::pushAllOrchestrationStackToGitHub,
@@ -422,7 +430,9 @@ fun MainHubScreen(
                             },
                             onRunOrchestrationTask = viewModel::runOrchestrationTask,
                             onRefreshHardening = viewModel::refreshHardeningState,
-                            onDecideApproval = viewModel::decideApproval,
+                            onDecideApproval = { approvalId, approve ->
+                                viewModel.decideApprovalZeroTrust(fragmentActivity, approvalId, approve)
+                            },
                             onToggleSafeMode = viewModel::setCircuitBreakerSafeMode,
                             onSetOperatingMode = viewModel::setSustainabilityMode,
                             onSyncPolicy = viewModel::syncGovernancePolicy,
@@ -433,6 +443,8 @@ fun MainHubScreen(
                             onCreateDrSnapshot = viewModel::createDrSnapshot,
                             onRestoreDrSnapshot = viewModel::restoreLatestDrSnapshot,
                             onPingDeadmanSwitch = viewModel::pingDeadmanSwitch,
+                            onRegisterBiometricKey = viewModel::registerBiometricHardwareKey,
+                            onAskAuditRag = viewModel::askAuditKnowledge,
                             onSaveTemplate = { tpl ->
                                 viewModel.saveBlueprint(
                                     title = tpl.title,
@@ -489,4 +501,10 @@ fun MainHubScreen(
             }
         )
     }
+}
+
+private tailrec fun Context.findFragmentActivity(): FragmentActivity? = when (this) {
+    is FragmentActivity -> this
+    is ContextWrapper -> baseContext.findFragmentActivity()
+    else -> null
 }

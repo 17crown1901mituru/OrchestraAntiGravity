@@ -55,6 +55,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.StackTemplates
+import com.example.model.AskRagResult
 import com.example.model.EmailRouteTarget
 import com.example.model.OrchestrationHardeningState
 import com.example.model.OrchestrationRunResult
@@ -70,6 +71,8 @@ fun DeployKitScreen(
     isHardeningBusy: Boolean = false,
     lastOrchestrationResult: OrchestrationRunResult? = null,
     hardeningState: OrchestrationHardeningState = OrchestrationHardeningState(),
+    lastAskResult: AskRagResult? = null,
+    isAskingRag: Boolean = false,
     githubRepoConfigured: Boolean = false,
     onPushTemplateToGitHub: (filePath: String, content: String, commitMessage: String) -> Unit = { _, _, _ -> },
     onPushAllOrchestrationStack: () -> Unit = {},
@@ -87,6 +90,8 @@ fun DeployKitScreen(
     onCreateDrSnapshot: () -> Unit = {},
     onRestoreDrSnapshot: () -> Unit = {},
     onPingDeadmanSwitch: () -> Unit = {},
+    onRegisterBiometricKey: () -> Unit = {},
+    onAskAuditRag: (String) -> Unit = {},
     onSaveTemplate: (StackTemplate) -> Unit,
     onShowMessage: (String) -> Unit
 ) {
@@ -278,7 +283,12 @@ fun DeployKitScreen(
                             onTriggerAutoTune = onTriggerAutoTune,
                             onCreateDrSnapshot = onCreateDrSnapshot,
                             onRestoreDrSnapshot = onRestoreDrSnapshot,
-                            onPingDeadmanSwitch = onPingDeadmanSwitch
+                            onPingDeadmanSwitch = onPingDeadmanSwitch,
+                            onRegisterBiometricKey = onRegisterBiometricKey,
+                            lastAskResult = lastAskResult,
+                            isAskingRag = isAskingRag,
+                            onAskAuditRag = onAskAuditRag,
+                            onShowMessage = onShowMessage
                         )
                     }
                 }

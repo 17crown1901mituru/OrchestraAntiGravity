@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.BridgeCallResult
@@ -11,12 +12,14 @@ import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
 import com.example.data.MultimodalSourceLoader
+import com.example.data.OrchestrationExtendedClient
 import com.example.data.OrchestrationHardeningClient
 import com.example.data.StackTemplates
 import com.example.data.SyncSnapshotStore
 import com.example.data.WebContextCrawler
 import com.example.model.AgentBlueprint
 import com.example.model.AiGenerationState
+import com.example.model.AskRagResult
 import com.example.model.AttachedSource
 import com.example.model.BackgroundSyncSettings
 import com.example.model.CostAlert
@@ -39,8 +42,10 @@ import com.example.model.VaultMetadata
 import com.example.model.WebCrawlPreview
 import com.example.model.WorkflowNode
 import com.example.model.WorkflowPlanResult
+import com.example.security.BiometricHardwareSigner
 import com.example.sync.BackgroundSyncScheduler
 import com.example.sync.SyncWorkUiState
+import com.example.widget.updateGlanceWidgetFromState
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Schema
@@ -206,12 +211,19 @@ class HubViewModel(
     val lastOrchestrationResult: StateFlow<OrchestrationRunResult?> = _lastOrchestrationResult.asStateFlow()
 
     private val hardeningClient by lazy { OrchestrationHardeningClient() }
+    private val extendedClient by lazy { OrchestrationExtendedClient() }
 
     private val _hardeningState = MutableStateFlow(OrchestrationHardeningState())
     val hardeningState: StateFlow<OrchestrationHardeningState> = _hardeningState.asStateFlow()
 
     private val _isHardeningBusy = MutableStateFlow(false)
     val isHardeningBusy: StateFlow<Boolean> = _isHardeningBusy.asStateFlow()
+
+    private val _lastAskResult = MutableStateFlow<AskRagResult?>(null)
+    val lastAskResult: StateFlow<AskRagResult?> = _lastAskResult.asStateFlow()
+
+    private val _isAskingRag = MutableStateFlow(false)
+    val isAskingRag: StateFlow<Boolean> = _isAskingRag.asStateFlow()
 
     private val _credentials = MutableStateFlow(secretsStore.loadForUser(currentUserId))
     val credentials: StateFlow<ExternalCredentials> = _credentials.asStateFlow()
@@ -341,7 +353,9 @@ class HubViewModel(
     fun crawlDomainOrUrl(
         rawUrlOrDomain: String,
         mode: CrawlMode,
-        profile: DeviceViewportProfile
+        profile: DeviceViewportProfile,
+        preferEnglish: Boolean = true,
+        maxPages: Int = if (mode == CrawlMode.PATH_RECURSIVE) 20 else 4
     ) {
         if (rawUrlOrDomain.isBlank() || _isCrawlingWeb.value) return
         viewModelScope.launch {
@@ -355,7 +369,9 @@ class HubViewModel(
                     profile = profile,
                     gatewayBaseUrl = creds.gc2223Endpoint,
                     gatewayBearerToken = creds.gc2223BearerToken,
-                    firebaseIdToken = idToken
+                    firebaseIdToken = idToken,
+                    maxPages = maxPages,
+                    preferEnglish = preferEnglish
                 )
                 result.onSuccess { output ->
                     val newUris = buildList {
@@ -369,10 +385,18 @@ class HubViewModel(
                         deviceProfileLabel = profile.label,
                         summarySnippet = output.summarySnippet,
                         attachedFileName = output.markdownFileName,
-                        hasScreenshot = output.screenshotUri != null
+                        hasScreenshot = output.screenshotUri != null,
+                        savedSessionDirName = output.sessionDirectoryName,
+                        languageSummary = output.languageSummary
                     )
                     val screenSuffix = if (output.screenshotUri != null) " + 画面PNG" else ""
-                    _statusBanner.value = "${output.pageCount}ページ取得し添付しました ($screenSuffix)".replace("()", "").trim()
+                    val mdSuffix = if (output.perPageMarkdownFiles.size > 1) {
+                        " (.md ${output.perPageMarkdownFiles.size}件)"
+                    } else ""
+                    val langSuffix = if (output.languageSummary.isNotBlank()) {
+                        " [${output.languageSummary}]"
+                    } else ""
+                    _statusBanner.value = "${output.pageCount}ページ取得し添付しました$mdSuffix$langSuffix$screenSuffix".trim()
                 }.onFailure { err ->
                     _statusBanner.value = "URL取得失敗: ${err.localizedMessage ?: "Network error"}"
                 }
@@ -558,25 +582,108 @@ class HubViewModel(
                     firebaseIdToken = fetchFirebaseIdToken()
                 )
                 _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
             }
         }
     }
 
-    fun decideApproval(approvalId: String, approve: Boolean) {
+    fun registerBiometricHardwareKey() {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                if (!BiometricHardwareSigner.canAuthenticateBiometric(applicationContext)) {
+                    _statusBanner.value = "端末に生体認証 (指紋/顔 Strong Biometric) が設定されていません"
+                    return@launch
+                }
+                val exported = BiometricHardwareSigner.ensureOrCreateSigningKey()
+                    .getOrElse { err ->
+                        _statusBanner.value = "Keystore 鍵生成失敗: ${err.localizedMessage ?: "Error"}"
+                        return@launch
+                    }
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val res = extendedClient.registerHardwarePublicKey(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken,
+                    keyId = exported.keyId,
+                    spkiB64 = exported.spkiB64
+                )
+                _statusBanner.value = res.message
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun decideApprovalZeroTrust(activity: FragmentActivity?, approvalId: String, approve: Boolean) {
         if (_isHardeningBusy.value || approvalId.isBlank()) return
         viewModelScope.launch {
             _isHardeningBusy.value = true
             try {
                 val creds = _credentials.value
                 val idToken = fetchFirebaseIdToken()
+                var challengeStr: String? = null
+                var actionHashStr: String? = null
+                var sigB64: String? = null
+                var keyIdStr: String? = null
+
+                if (approve && _hardeningState.value.hardwareKeyRegistered) {
+                    val chRes = extendedClient.requestApprovalChallenge(
+                        baseUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = idToken,
+                        approvalId = approvalId
+                    )
+                    if (!chRes.success) {
+                        _statusBanner.value = chRes.message
+                        return@launch
+                    }
+                    if (chRes.requiresHardwareSignature) {
+                        if (activity == null) {
+                            _statusBanner.value = "生体認証プロンプトの起動にはアクティブな画面コンテキストが必要です"
+                            return@launch
+                        }
+                        if (!BiometricHardwareSigner.hasHardwareKey()) {
+                            _statusBanner.value = "この端末に Keystore 秘密鍵が存在しません。先に「生体署名鍵を登録」を実行してください"
+                            return@launch
+                        }
+                        val payloadToSign = "${approvalId}|${chRes.actionHash}|${chRes.challenge}"
+                        val signed = BiometricHardwareSigner.signChallengeWithBiometric(
+                            activity = activity,
+                            payload = payloadToSign
+                        )
+                        if (signed.isFailure) {
+                            _statusBanner.value = signed.exceptionOrNull()?.localizedMessage ?: "生体署名がキャンセルされました"
+                            return@launch
+                        }
+                        challengeStr = chRes.challenge
+                        actionHashStr = chRes.actionHash
+                        sigB64 = signed.getOrThrow()
+                        keyIdStr = chRes.keyId.ifBlank { BiometricHardwareSigner.exportPublicKeyIfPresent()?.keyId }
+                    }
+                }
+
                 val res = hardeningClient.decideApproval(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken,
                     approvalId = approvalId,
-                    approve = approve
+                    approve = approve,
+                    challenge = challengeStr,
+                    actionHash = actionHashStr,
+                    signatureB64 = sigB64,
+                    keyId = keyIdStr
                 )
                 _statusBanner.value = res.message
                 if (res.success) {
@@ -588,13 +695,39 @@ class HubViewModel(
                         source = "AUTO_TELEMETRY"
                     )
                 }
-                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken
                 )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun decideApproval(approvalId: String, approve: Boolean) {
+        decideApprovalZeroTrust(activity = null, approvalId = approvalId, approve = approve)
+    }
+
+    fun askAuditKnowledge(question: String) {
+        if (_isAskingRag.value || question.isBlank()) return
+        viewModelScope.launch {
+            _isAskingRag.value = true
+            try {
+                val creds = _credentials.value
+                val res = extendedClient.askAuditKnowledge(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = fetchFirebaseIdToken(),
+                    question = question
+                )
+                _lastAskResult.value = res
+                _statusBanner.value = res.statusMessage
+            } finally {
+                _isAskingRag.value = false
             }
         }
     }
@@ -614,11 +747,13 @@ class HubViewModel(
                     reason = reason
                 )
                 _statusBanner.value = res.message
-                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken
                 )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
             }
@@ -639,11 +774,13 @@ class HubViewModel(
                     mode = mode
                 )
                 _statusBanner.value = res.message
-                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken
                 )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
             }
@@ -666,11 +803,13 @@ class HubViewModel(
                     policyJsonRaw = policyTpl
                 )
                 _statusBanner.value = res.message
-                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken
                 )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
             }
@@ -746,11 +885,13 @@ class HubViewModel(
                 val idToken = fetchFirebaseIdToken()
                 val res = block(creds, idToken)
                 _statusBanner.value = res.message
-                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                val snapshot = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,
                     bearerToken = creds.gc2223BearerToken,
                     firebaseIdToken = idToken
                 )
+                _hardeningState.value = snapshot
+                updateGlanceWidgetFromState(applicationContext, snapshot)
             } finally {
                 _isHardeningBusy.value = false
             }

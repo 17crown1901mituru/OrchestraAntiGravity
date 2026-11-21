@@ -12,6 +12,7 @@ import com.example.data.LocalSecretsStore
 import com.example.data.OrchestrationHardeningClient
 import com.example.data.SyncSnapshotStore
 import com.example.model.SyncHealthState
+import com.example.widget.updateGlanceWidgetFromState
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestore
@@ -135,6 +136,10 @@ class CloudStatusSyncWorker(
                     )
                 }.getOrNull()
             } else null
+
+            if (hardening != null) {
+                updateGlanceWidgetFromState(applicationContext, hardening)
+            }
 
             if (hardening?.safeMode == true) {
                 UrgentAlertNotifier.notifyUrgentAlert(

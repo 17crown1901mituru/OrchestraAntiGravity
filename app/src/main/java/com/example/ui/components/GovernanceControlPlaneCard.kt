@@ -14,7 +14,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.FactCheck
+import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.Key
+import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Sync
@@ -140,6 +142,27 @@ fun GovernanceControlPlaneCard(
                     title = "カオス自己診断 (GameDay)",
                     value = state.lastChaosScorePct?.let { "スコア ${it}%" } ?: "未実行",
                     detail = state.lastChaosDrilledAt.take(16).ifBlank { "月次Dry-Run待機" },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // Pillar 1 & 2: Hardware Zero-Trust & GitHub Actions Monthly CI Quota
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                GovernanceTile(
+                    icon = Icons.Rounded.Fingerprint,
+                    title = "Hardware Zero-Trust",
+                    value = if (state.hardwareKeyRegistered) "ECDSA 有効" else "鍵未登録",
+                    detail = if (state.hardwareKeyRegistered) "Key: ${state.hardwareKeyId.take(12)}" else "StrongBox/TEE 署名推奨",
+                    modifier = Modifier.weight(1f)
+                )
+                GovernanceTile(
+                    icon = Icons.Rounded.Memory,
+                    title = "CI 月間無料枠 / DAG",
+                    value = "${state.ciMinutesUsedMonth} / ${state.ciMinutesLimit}分",
+                    detail = if (state.ciOffloadActive) "Federation Offload 作動中" else "並列 DAG • チェックポイント有効",
                     modifier = Modifier.weight(1f)
                 )
             }

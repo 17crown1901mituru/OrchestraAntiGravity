@@ -6,6 +6,7 @@ import com.example.model.OrchestrationHardeningState
 import com.example.model.PendingApprovalItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -18,6 +19,7 @@ class OrchestrationHardeningClient(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
+        .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT))
         .build()
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -77,6 +79,19 @@ class OrchestrationHardeningClient(
             val dr = stateJson.optJSONObject("dr")
             val freeTier = stateJson.optJSONObject("freeTierGuard")
             val deadman = stateJson.optJSONObject("deadman")
+            val hwAuth = stateJson.optJSONObject("hardwareAuth")
+            val ciQuota = stateJson.optJSONObject("ciQuota")
+            val telemetry = stateJson.optJSONObject("platformTelemetry")
+            val finopsJson = stateJson.optJSONObject("finopsBreakdown")
+            val finopsMap = buildMap<String, Int> {
+                if (finopsJson != null) {
+                    val keys = finopsJson.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        put(k, finopsJson.optInt(k, 0))
+                    }
+                }
+            }
             val parsedNodes = parseNodes(fed?.optJSONArray("nodes"))
 
             OrchestrationHardeningState(
@@ -144,6 +159,17 @@ class OrchestrationHardeningClient(
                 goldenScorePct = tuning?.optInt("goldenScorePct", 100) ?: 100,
                 autoTuneBlockedByGolden = tuning?.optBoolean("blockedByGoldenGate", false) ?: false,
                 drKdfAlgorithm = dr?.optString("kdf", "PBKDF2-SHA256").orEmpty().ifBlank { "PBKDF2-SHA256" },
+                hardwareKeyRegistered = !hwAuth?.optString("registeredKeyId", "").isNullOrBlank(),
+                hardwareKeyId = hwAuth?.optString("registeredKeyId", "").orEmpty(),
+                ciMinutesUsedMonth = ciQuota?.optInt("minutesUsedMonth", 0) ?: 0,
+                ciMinutesLimit = ciQuota?.optInt("minutesLimit", 2000) ?: 2000,
+                ciOffloadActive = ciQuota?.optBoolean("offloadActive", false) ?: false,
+                actualKvWrites = telemetry?.optInt("actualKvWrites", 0) ?: 0,
+                actualR2Ops = telemetry?.optInt("actualR2Ops", 0) ?: 0,
+                actualWorkerCpuMs = telemetry?.optInt("actualCpuMs", 0) ?: 0,
+                deltaKvWrites = telemetry?.optInt("deltaKvWrites", 0) ?: 0,
+                telemetrySyncedAt = telemetry?.optString("syncedAt", "").orEmpty(),
+                finopsBreakdown = finopsMap,
                 approvals = approvals,
                 recentAuditLogs = auditLogs,
                 statusMessage = if (stateJson.optBoolean("safeMode", false)) {
@@ -164,12 +190,20 @@ class OrchestrationHardeningClient(
         bearerToken: String,
         firebaseIdToken: String?,
         approvalId: String,
-        approve: Boolean
+        approve: Boolean,
+        challenge: String? = null,
+        actionHash: String? = null,
+        signatureB64: String? = null,
+        keyId: String? = null
     ): BridgeCallResult = withContext(Dispatchers.IO) {
         val cleanBase = normalizeUrl(baseUrl)
         val body = JSONObject().apply {
             put("approvalId", approvalId)
             put("approve", approve)
+            if (!challenge.isNullOrBlank()) put("challenge", challenge)
+            if (!actionHash.isNullOrBlank()) put("actionHash", actionHash)
+            if (!signatureB64.isNullOrBlank()) put("signatureB64", signatureB64)
+            if (!keyId.isNullOrBlank()) put("keyId", keyId)
         }.toString()
         executePost("$cleanBase/v1/approvals/decide", bearerToken, firebaseIdToken, body) { code, raw ->
             val json = runCatching { JSONObject(raw) }.getOrNull()
@@ -451,6 +485,10 @@ class OrchestrationHardeningClient(
             val obj = arr.optJSONObject(idx) ?: return@mapNotNull null
             val id = obj.optString("approvalId").ifBlank { return@mapNotNull null }
             val conf = if (obj.has("confidence") && !obj.isNull("confidence")) obj.optDouble("confidence") else null
+            val warnArr = obj.optJSONArray("criticWarnings")
+            val warnings = if (warnArr != null) {
+                (0 until warnArr.length()).mapNotNull { warnArr.optString(it).takeIf { w -> w.isNotBlank() } }
+            } else emptyList()
             PendingApprovalItem(
                 approvalId = id,
                 action = obj.optString("action", ""),
@@ -460,7 +498,10 @@ class OrchestrationHardeningClient(
                 traceId = obj.optString("traceId", ""),
                 expiresAtMs = obj.optLong("expiresAtMs", 0L),
                 aiConfidence = conf,
-                aiReasoning = obj.optString("reasoning", "")
+                aiReasoning = obj.optString("reasoning", ""),
+                actionHash = obj.optString("actionHash", ""),
+                criticWarnings = warnings,
+                criticRiskLevel = obj.optString("criticRiskLevel", "")
             )
         }
     }

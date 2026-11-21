@@ -46,7 +46,12 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
      - **暗号化 DR バックアップ＆ローカル自己完結復元 (`POST /v1/dr/snapshot`, `POST /v1/dr/restore`, `scripts/bootstrap-dr.sh --local`)**: R2 へ **PBKDF2-SHA256**（100,000 回反復＋ランダムソルト）＋ **AES-256-GCM** 暗号化スナップショットを退避し、`DR_PASSPHRASE` 単体でのオフライン復号復旧にも対応。
      - **無料枠天井ガード (`Free-Tier Guard`)**: `ORCH_KV` の高頻度書き込み（レート制限・Heartbeat・推論キャッシュ等）を **Cloudflare Workers Cache API (`caches.default`)** へ逃がして 1,000 writes/日上限を回避し、Workers AI の 10,000 Neurons/日消費を計測して 80% で軽量モデル（1B）へ自動縮退（倹約AIモード）、95% でルールベースへフェイルオーバー。
      - **多重外部監視 (`Dead Man's Switch` & FCM / ローカル通知)**: 6時間 Cron / `POST /v1/health/deadman-ping` で外部監視 URL（`DEADMAN_PING_URL`）へ Ping し、緊急アラート・メール送信障害時は FCM フォールバック（`sendFcmFallback`）および Android 側の `UrgentAlertNotifier`（`POST_NOTIFICATIONS`）で端末へ通知。
-   - **アプリ側制御・レジリエンス UI (`SustainabilityTelemetryCard`, `GovernanceControlPlaneCard`, `ResilienceOperationsCard`)**: 無料枠消費ゲージ、監査チェーン検証、カオス自己診断、端末ノード登録、自己進化 PR 生成、暗号化 DR 退避／復元、Dead Man Ping をワンタップで操作可能。
+   - **アプリ側制御・レジリエンス UI (`SustainabilityTelemetryCard`, `GovernanceControlPlaneCard`, `ResilienceOperationsCard`, `AuditRagQueryCard`)**: 無料枠消費ゲージ、監査チェーン検証、カオス自己診断、端末ノード登録、自己進化 PR 生成、暗号化 DR 退避／復元、Dead Man Ping、生体署名鍵登録、R2 監査 RAG 検索をワンタップで操作可能。
+   - **生体認証＋ハードウェア鍵ゼロトラスト承認 (`BiometricHardwareSigner`, `/v1/approvals/register-key`, `/v1/approvals/challenge`)**: Android Keystore (StrongBox / TEE) 上に ECDSA P-256 鍵を生成し、承認時に `BiometricPrompt` でワンタイムチャレンジへ電子署名（DER→IEEE P1363変換）して Worker の Web Crypto `crypto.subtle.verify` で検証。
+   - **DAG 並列オーケストレーション & GitHub Actions 月間枠防衛 (`.github/workflows/antigravity-orchestrator.yml`, `/v1/dag/*`)**: `dag-init` → `deploy-gateway-worker` ∥ `terraform-verify` → `health-audit` の並列 DAG 実行とチェックポイント再試行スキップ、さらに月間 2,000 分の 75%（1,500分）超過時に Federation ノードへ自動オフロード。
+   - **Maker-Checker 敵対的Critic & JSON Schema 強制 (`runAdversarialCritic`)**: Workers AI 呼び出しで `json_schema` 構造化出力を強制し、`ci-heal@` / `tf@` / `tf_apply` 提案を別視点 AI が危険検証して承認カードへ警告表示（`criticRiskLevel` / `criticWarnings`）。
+   - **Cloudflare GraphQL 実測テレメトリ & FinOps タグ集計**: 6時間毎 Cron で Cloudflare GraphQL Analytics API から KV/R2/CPU 実測値を同期して乖離補正し、ワークフローカテゴリ別（`ci-heal` / `tf` / `crawl` / `dr` / `control`）の内訳を可視化。
+   - **Jetpack Glance ホームウィジェット・Quick Settings Kill-Switch・R2 監査 RAG (`StatusGlanceWidget`, `KillSwitchTileService`, `POST /v1/ask`)**: ホーム画面ウィジェットで稼働モード・承認件数・無料枠残量を常時表示し、クイック設定タイルからワンタップで `SAFE_MODE` を緊急遮断可能。また、`@cf/baai/bge-small-en-v1.5` Embeddings による監査ログ RAG 検索を搭載。
 
 ---
 
@@ -67,6 +72,8 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
 │       │   ├── GitHubActivityService.kt     # GitHub リポジトリアクティビティサマリー取得サービス
 │       │   ├── LocalSecretsStore.kt         # Firebase UID 紐付け AES-256-GCM 暗号化ストレージ
 │       │   ├── MultimodalSourceLoader.kt    # Markdown / PDF / 画像 / 動画読み込み & Gemini Content 生成
+│       │   ├── OrchestrationExtendedClient.kt # ハードウェア公開鍵登録・チャレンジ取得・R2 RAG /v1/ask 通信
+│       │   ├── OrchestrationHardeningClient.kt # 制御プレーン状態取得・承認・監査検証・Chaos/DR API 通信
 │       │   ├── StackTemplates.kt            # Worker / Termux / GitHub Actions / GCP テンプレート集
 │       │   └── SyncSnapshotStore.kt         # WorkManager 同期結果（Cloud / Termux 分離）・間隔設定保存
 │       ├── firebase/
@@ -74,19 +81,28 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
 │       │   └── FirestoreErrorHandler.kt     # Firestore 例外ハンドリング・リトライ補助
 │       ├── model/
 │       │   └── Models.kt                    # UI 状態・Firestore エンティティ・同期スナップショットモデル
+│       ├── security/
+│       │   └── BiometricHardwareSigner.kt   # StrongBox/TEE ECDSA P-256 鍵管理・BiometricPrompt 署名・DER->P1363 変換
 │       ├── sync/
 │       │   ├── BackgroundSyncScheduler.kt   # 定期 / 即時 WorkManager スケジューリング・状態 Flow
-│       │   ├── CloudStatusSyncWorker.kt     # GitHub + Cloudflare ステータス取得 & 緊急ローカル通知判定
+│       │   ├── CloudStatusSyncWorker.kt     # GitHub + Cloudflare ステータス取得 & 緊急ローカル通知・ウィジェット同期
+│       │   ├── KillSwitchTileService.kt     # Quick Settings タイルからのワンタップ SAFE_MODE 緊急遮断トグル
 │       │   ├── TermuxAgentSyncWorker.kt     # Termux AntiGravityAgent ローカルステータス取得 CoroutineWorker
 │       │   └── UrgentAlertNotifier.kt       # SAFE_MODE / 障害時のローカル高優先度通知チャンネル制御
+│       ├── widget/
+│       │   ├── StatusGlanceWidget.kt        # Jetpack Glance ホームウィジェット（残枠・承認待ち・即時更新）
+│       │   ├── StatusGlanceWidgetReceiver.kt # Glance AppWidgetReceiver
+│       │   └── WidgetStateStore.kt          # SharedPreferences ベース軽量ウィジェット状態ストア
 │       └── ui/
+│           ├── components/                  # SustainabilityTelemetryCard / GovernanceControlPlaneCard / ResilienceOperationsCard / AuditRagQueryCard 等
 │           ├── screens/                     # Auth / MainHub / AgentChat / StatusDashboard / Nodes / CostMonitor / DeployKit / Blueprints / Settings
 │           ├── theme/                       # Material 3 カラー・タイポグラフィ・テーマ定義
 │           └── viewmodel/
-│               └── HubViewModel.kt          # UI StateFlow 管理・AI 生成・コスト判定・同期制御
+│               └── HubViewModel.kt          # UI StateFlow 管理・AI 生成・ゼロトラスト署名・コスト判定・同期制御
 ├── app/src/test/java/com/example/
 │   ├── ExampleUnitTest.kt                   # 基本ユニットテスト
-│   └── ExampleRobolectricTest.kt            # Keystore/Secrets, SyncSnapshotStore, Workers, GitHubActivityService の検証
+│   ├── ExampleRobolectricTest.kt            # Keystore/Secrets, SyncSnapshotStore, Workers, GitHubActivityService の検証
+│   └── ExtendedOrchestrationTest.kt         # DER->P1363署名, WidgetStateStore, Hardware Auth/RAG API, KillSwitchTileService 検証
 ├── firebase-blueprint.json                  # Firestore スキーマ定義
 ├── firestore.rules                          # Firestore ゼロトラストセキュリティルール
 ├── firestore.test.js                        # Firestore ルール検証テスト
@@ -100,9 +116,9 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
 | 分類 | 採用技術 / バージョン (`gradle/libs.versions.toml`) |
 | --- | --- |
 | 言語 / SDK | Kotlin `2.4.21` / AGP `9.1.1` / `minSdk = 24` / `targetSdk = 36` / `compileSdk = 36` |
-| UI | Jetpack Compose BOM `2024.09.00` / Material 3 / Navigation Compose `2.8.9` |
+| UI | Jetpack Compose BOM `2024.09.00` / Material 3 / Navigation Compose `2.8.9` / Jetpack Glance `1.1.1` |
 | Firebase | Firebase BOM `35.1.0` (`firebase-ai`, `firebase-firestore`, `firebase-auth`, `firebase-appcheck-*`) |
-| 認証 | Jetpack Credentials (`1.5.0`) + Google Identity (`googleid:1.1.1`) |
+| 認証・生体署名 | Jetpack Credentials (`1.5.0`) + Google Identity (`googleid:1.1.1`) / AndroidX Biometric (`1.1.0`) + StrongBox/TEE ECDSA |
 | 非同期・定期実行 | Kotlin Coroutines `1.10.2` / WorkManager (`work-runtime-ktx:2.12.0`) |
 | ネットワーク | OkHttp `4.10.0` / Logging Interceptor `4.10.0` |
 | テスト | JUnit `4.13.2` / Robolectric `4.16.1` / `work-testing:2.12.0` / `kotlinx-coroutines-test` |

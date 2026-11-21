@@ -14,6 +14,7 @@ import com.example.model.TermuxCommandResult
 import com.example.model.TermuxPresetCommand
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -35,6 +36,7 @@ class CloudBridgeClient(
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT))
         .build(),
     private val githubApiBaseUrl: String = "https://api.github.com"
 ) {
@@ -44,6 +46,7 @@ class CloudBridgeClient(
         .connectTimeout(4, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
         .writeTimeout(4, TimeUnit.SECONDS)
+        .connectionSpecs(listOf(ConnectionSpec.CLEARTEXT, ConnectionSpec.MODERN_TLS))
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -219,6 +222,7 @@ class CloudBridgeClient(
                     .url("https://api.github.com/user")
                     .header("Authorization", "Bearer ${pat.trim()}")
                     .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
                     .get()
                     .build()
                 client.newCall(request).execute().use { resp ->
@@ -262,6 +266,7 @@ class CloudBridgeClient(
                 .url(url)
                 .header("Authorization", "Bearer ${pat.trim()}")
                 .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
                 .post(bodyJson.toRequestBody(jsonMediaType))
                 .build()
             client.newCall(request).execute().use { resp ->
@@ -321,6 +326,7 @@ class CloudBridgeClient(
                 .url("$url?ref=$branch")
                 .header("Authorization", "Bearer ${pat.trim()}")
                 .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
                 .get()
                 .build()
             client.newCall(getReq).execute().use { getResp ->
@@ -344,6 +350,7 @@ class CloudBridgeClient(
                 .url(url)
                 .header("Authorization", "Bearer ${pat.trim()}")
                 .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
                 .put(bodyJson.toRequestBody(jsonMediaType))
                 .build()
 
@@ -382,6 +389,7 @@ class CloudBridgeClient(
                 .url(rerunFailedUrl)
                 .header("Authorization", "Bearer ${pat.trim()}")
                 .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
                 .post("".toRequestBody(jsonMediaType))
                 .build()
             client.newCall(req).execute().use { resp ->

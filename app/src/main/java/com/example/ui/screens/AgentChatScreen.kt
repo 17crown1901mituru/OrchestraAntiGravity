@@ -92,7 +92,7 @@ fun AgentChatScreen(
     attachedSources: List<AttachedSource>,
     isCrawlingWeb: Boolean,
     lastCrawlPreview: WebCrawlPreview?,
-    onCrawlUrlOrDomain: (String, CrawlMode, DeviceViewportProfile) -> Unit,
+    onCrawlUrlOrDomain: (String, CrawlMode, DeviceViewportProfile, Boolean, Int) -> Unit,
     onAttachDeviceScreenshot: (Bitmap, String, DeviceViewportProfile) -> Unit,
     onAddSourceUris: (List<Uri>) -> Unit,
     onRemoveSource: (String) -> Unit,
@@ -108,6 +108,8 @@ fun AgentChatScreen(
     var urlInput by rememberSaveable { mutableStateOf("") }
     var crawlMode by rememberSaveable { mutableStateOf(CrawlMode.DOMAIN_CRAWL) }
     var deviceProfile by rememberSaveable { mutableStateOf(DeviceViewportProfile.PIXEL_9_PRO) }
+    var preferEnglish by rememberSaveable { mutableStateOf(true) }
+    var recursiveMaxPages by rememberSaveable { mutableStateOf(20) }
     var showDeviceCaptureDialog by rememberSaveable { mutableStateOf(false) }
 
     val mediaPickerLauncher = rememberLauncherForActivityResult(
@@ -132,6 +134,7 @@ fun AgentChatScreen(
             "gc2223.com に Workers AI + Gemini ルーターを組む" to "gc2223.com の Cloudflare Worker で Workers AI 無料枠を優先し、複雑タスクだけ GCP/Gemini へ逃がすルーティング設計と wrangler コマンドを作って",
             "Termux AntiGravityAgent 拡張" to "Termux 上で antigravity コマンドを実行したとき、GitHub Actions と gc2223.com を安全に連携させる CLI フックを設計して",
             "GCP Always Free + 予算$1ガード" to "クレジットカード登録後の GCP で課金事故をゼロにする予算アラート・Cloud Run 最小設定・Workload Identity 連携手順をまとめて",
+            "Cloud Docs 最適化監査" to "取得した https://cloud.google.com/docs 配下の .md ドキュメントと現在の Terraform/Worker 構成を Google Cloud Well-Architected 6本の柱、OWASP Top 10:2025、Cloud Quotas アラート、TLS 1.2+ 制約、gcloud beta terraform vet で監査し改善点を実行可能なコマンド付きで列挙して",
             "Google Dev Program 特典活用" to "Google Developer Program の特典や学習リソースを GCP / Firebase 構成のコスト最適化にどう組み合わせるか提案して"
         )
     }
@@ -260,8 +263,8 @@ fun AgentChatScreen(
                     OutlinedTextField(
                         value = urlInput,
                         onValueChange = { urlInput = it },
-                        label = { Text("URL または ドメイン (例: google.com)") },
-                        placeholder = { Text("google.com / https://gc2223.com") },
+                        label = { Text("URL または ドメイン (例: cloud.google.com/docs)") },
+                        placeholder = { Text("https://cloud.google.com/docs / https://gc2223.com") },
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -293,12 +296,46 @@ fun AgentChatScreen(
                         }
                     }
 
+                    if (crawlMode == CrawlMode.PATH_RECURSIVE) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            FilterChip(
+                                selected = preferEnglish,
+                                onClick = { preferEnglish = !preferEnglish },
+                                label = { Text(if (preferEnglish) "英語基本+固有言語" else "元言語のまま") },
+                                modifier = Modifier.testTag("crawl_prefer_english_chip")
+                            )
+                            listOf(20, 35, 50).forEach { limit ->
+                                FilterChip(
+                                    selected = recursiveMaxPages == limit,
+                                    onClick = { recursiveMaxPages = limit },
+                                    label = { Text("最大${limit}p") },
+                                    modifier = Modifier.testTag("crawl_max_pages_$limit")
+                                )
+                            }
+                        }
+                        Text(
+                            text = "指定 URL の PATH 配下を英語基本（固有言語のみの場合は自動フォールバック）で再帰巡回し、構造化 .md と統合インデックスを生成します",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.testTag("path_recursive_hint")
+                        )
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         OutlinedButton(
-                            onClick = { onCrawlUrlOrDomain(urlInput, crawlMode, deviceProfile) },
+                            onClick = {
+                                val limit = if (crawlMode == CrawlMode.PATH_RECURSIVE) recursiveMaxPages else 4
+                                onCrawlUrlOrDomain(urlInput, crawlMode, deviceProfile, preferEnglish, limit)
+                            },
                             enabled = urlInput.isNotBlank() && !isCrawlingWeb,
                             modifier = Modifier
                                 .weight(1f)
@@ -347,6 +384,25 @@ fun AgentChatScreen(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                if (lastCrawlPreview.savedSessionDirName.isNotBlank()) {
+                                    Text(
+                                        text = "保存先: web_captures/${lastCrawlPreview.savedSessionDirName}/ (${lastCrawlPreview.attachedFileName})",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                if (lastCrawlPreview.languageSummary.isNotBlank()) {
+                                    Text(
+                                        text = "取得言語: ${lastCrawlPreview.languageSummary}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("crawl_language_summary")
+                                    )
+                                }
                                 if (lastCrawlPreview.summarySnippet.isNotBlank()) {
                                     Text(
                                         text = lastCrawlPreview.summarySnippet,

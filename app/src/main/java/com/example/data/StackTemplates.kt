@@ -33,14 +33,14 @@ export default {
       });
     }
 
-    // 3. Seamless SSO + Bearer Auth Guard
+    // 3. Seamless SSO + Timing-Safe Bearer Auth Guard
     const auth = request.headers.get("Authorization") || "";
     const fbToken = request.headers.get("X-Firebase-Token") || "";
-    const bearerOk = Boolean(env.AGENT_BEARER_TOKEN && auth === `Bearer ${'$'}{env.AGENT_BEARER_TOKEN}`);
-    const ssoUser = fbToken ? await verifyFirebaseToken(fbToken, env.FIREBASE_PROJECT_ID) : null;
+    const bearerOk = Boolean(env.AGENT_BEARER_TOKEN && timingSafeEqualStrings(auth, `Bearer ${'$'}{env.AGENT_BEARER_TOKEN}`));
+    const ssoUser = fbToken ? await verifyFirebaseToken(fbToken, env.FIREBASE_PROJECT_ID, env.ALLOWED_FIREBASE_EMAIL) : null;
 
     if (!bearerOk && !ssoUser) {
-      return Response.json({ error: "Unauthorized (Bearer or Google SSO token required)" }, { status: 401 });
+      return Response.json({ error: "Unauthorized (Bearer or verified Google SSO token required)" }, { status: 401 });
     }
 
     // 4. LLM Chat endpoint (/v1/chat)
@@ -99,6 +99,7 @@ export default {
           headers: {
             "Authorization": `Bearer ${'$'}{env.GITHUB_PAT}`,
             "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "AntiGravityAgent-Worker"
           },
           body: JSON.stringify({ ref })
@@ -111,15 +112,66 @@ export default {
   }
 };
 
-async function verifyFirebaseToken(idToken, expectedProject) {
+function timingSafeEqualStrings(a, b) {
+  const enc = new TextEncoder();
+  const aBuf = enc.encode(String(a || ""));
+  const bBuf = enc.encode(String(b || ""));
+  if (aBuf.byteLength !== bBuf.byteLength) {
+    crypto.subtle.timingSafeEqual(aBuf, aBuf);
+    return false;
+  }
+  return crypto.subtle.timingSafeEqual(aBuf, bBuf);
+}
+
+let cachedFirebaseJwks = null;
+let cachedFirebaseJwksExpMs = 0;
+
+async function fetchFirebasePublicJwks() {
+  if (cachedFirebaseJwks && Date.now() < cachedFirebaseJwksExpMs) {
+    return cachedFirebaseJwks;
+  }
+  const res = await fetch("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com");
+  if (!res.ok) return cachedFirebaseJwks || [];
+  const cc = res.headers.get("Cache-Control") || "";
+  const maxAge = Number((cc.match(/max-age=(\d+)/i) || [])[1] || 3600);
+  const data = await res.json();
+  cachedFirebaseJwks = Array.isArray(data.keys) ? data.keys : [];
+  cachedFirebaseJwksExpMs = Date.now() + maxAge * 1000;
+  return cachedFirebaseJwks;
+}
+
+function base64UrlToUint8Array(b64u) {
+  const b64 = b64u.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64u.length + 3) % 4);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function verifyFirebaseToken(idToken, expectedProject, allowedEmail = "17crown2223@gmail.com") {
   try {
+    if (!expectedProject) return null;
     const parts = idToken.split(".");
     if (parts.length !== 3) return null;
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-    if (expectedProject && payload.aud !== expectedProject) return null;
-    if (payload.email !== "17crown2223@gmail.com") return null;
-    if (payload.exp * 1000 < Date.now()) return null;
-    return payload;
+    const header = JSON.parse(new TextDecoder().decode(base64UrlToUint8Array(parts[0])));
+    if (header.alg !== "RS256" || !header.kid) return null;
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlToUint8Array(parts[1])));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (payload.aud !== expectedProject) return null;
+    if (payload.iss !== `https://securetoken.google.com/${'$'}{expectedProject}`) return null;
+    if (typeof payload.sub !== "string" || payload.sub.length === 0 || payload.sub.length > 128) return null;
+    if (typeof payload.iat !== "number" || payload.iat > nowSec + 300) return null;
+    if (typeof payload.exp !== "number" || payload.exp <= nowSec) return null;
+    if (allowedEmail && (payload.email !== allowedEmail || payload.email_verified !== true)) return null;
+
+    const jwks = await fetchFirebasePublicJwks();
+    const jwk = jwks.find(k => k.kid === header.kid);
+    if (!jwk) return null;
+    const pubKey = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    const signedData = new TextEncoder().encode(`${'$'}{parts[0]}.${'$'}{parts[1]}`);
+    const sig = base64UrlToUint8Array(parts[2]);
+    const valid = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", pubKey, sig, signedData);
+    return valid ? payload : null;
   } catch {
     return null;
   }
@@ -155,6 +207,8 @@ echo "Installed AntiGravityAgent CLI to ~/.local/bin/antigravity"
             content = """name = "antigravity-gateway"
 main = "src/worker.js"
 compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
 
 routes = [
   { pattern = "gc2223.com/*", zone_name = "gc2223.com" }
@@ -498,9 +552,18 @@ on:
         required: false
         default: "manual"
 
+permissions: {}
+
+concurrency:
+  group: deploy-worker-${'$'}{{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy-cloudflare-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: cloudflare/wrangler-action@v3
@@ -511,25 +574,34 @@ jobs:
         ),
         StackTemplate(
             id = "gcp_zero_cost_guard",
-            title = "GCP Always Free + $0.10/日 ($3/月) メール通知",
+            title = "GCP Always Free + $0.10/日 ($3/月) + Cloud Quotas & TLS 1.2+ ガード",
             category = "GCP",
             targetHost = "Google Cloud Platform",
-            subtitle = "17crown2223@gmail.com へ自動メール通知する GCP 予算アラート & Always Free デプロイ",
-            freeTierSummary = "Cloud Run 月 200万 req 無料 ・ Workflows 月 5,000 ステップ無料",
+            subtitle = "17crown2223@gmail.com へ自動メール通知する GCP 予算アラート・Cloud Quotas 監視・TLS 1.2+ / WIF 最少権限デプロイ",
+            freeTierSummary = "Cloud Run 月 200万 req 無料 ・ Workflows 月 5,000 ステップ無料 ・ Cloud Quotas 監視",
             content = """# 1. Set your GCP project (linked to 17crown2223@gmail.com)
 export PROJECT_ID="gen-lang-client-0439741065"
 gcloud config set project "${'$'}PROJECT_ID"
 
-# 2. Enable free-tier-friendly APIs & Budget Notifications
-gcloud services enable run.googleapis.com workflows.googleapis.com billingbudgets.googleapis.com monitoring.googleapis.com pubsub.googleapis.com
+# 2. Enable free-tier-friendly APIs, Cloud Quotas & Budget Notifications
+gcloud services enable \
+  run.googleapis.com \
+  workflows.googleapis.com \
+  billingbudgets.googleapis.com \
+  monitoring.googleapis.com \
+  pubsub.googleapis.com \
+  cloudquotas.googleapis.com
 
-# 3. Create email notification channel for 17crown2223@gmail.com
+# 3. Inspect active service quotas (prevent runaway free-tier exhaustion)
+gcloud quotas info list --service=run.googleapis.com --project="${'$'}PROJECT_ID" --limit=10
+
+# 4. Create email notification channel for 17crown2223@gmail.com
 gcloud beta monitoring channels create \
   --display-name="AntiGravity Cost Alert Email" \
   --type=email \
   --channel-labels=email_address=17crown2223@gmail.com
 
-# 4. Create $3.00/month ($0.10/day equivalent) budget alert
+# 5. Create $3.00/month ($0.10/day equivalent) budget alert
 # Find Billing ID via: gcloud billing accounts list
 gcloud billing budgets create \
   --billing-account="YOUR_BILLING_ACCOUNT_ID" \
@@ -539,7 +611,7 @@ gcloud billing budgets create \
   --threshold-rule=percent=0.5 \
   --threshold-rule=percent=1.0
 
-# 5. Deploy Always-Free Cloud Run backend (min-instances=0 -> idle ¥0)
+# 6. Deploy Always-Free Cloud Run backend (min-instances=0 -> idle ¥0)
 gcloud run deploy antigravity-core \
   --source . \
   --region us-central1 \
@@ -547,6 +619,47 @@ gcloud run deploy antigravity-core \
   --max-instances 1 \
   --cpu 1 --memory 256Mi \
   --allow-unauthenticated
+
+# 7. API Key & Quota Project Header Hygiene (never pass ?key= in URL queries):
+# curl -H "x-goog-api-key: ${'$'}API_KEY" -H "x-goog-user-project: ${'$'}PROJECT_ID" ...
+"""
+        ),
+        StackTemplate(
+            id = "gcp_docs_well_architected",
+            title = "Google Cloud Docs Best Practices 統合監査 (Well-Architected + OWASP 2025)",
+            category = "GCP",
+            targetHost = "https://cloud.google.com/docs",
+            subtitle = "Well-Architected 6本の柱・OWASP Top 10:2025・Terraform vet・Org Policy TLS 1.2+・SA鍵禁止・CUD/Quota チェックリスト",
+            freeTierSummary = "cloud.google.com/docs 再帰取得 .md 知見を IaC / CI / クライアントへ反映",
+            content = """# Google Cloud Well-Architected & Security Hardening Checklist
+# Derived from https://docs.cloud.google.com/docs recursive .md audit
+
+## 1. Operational Excellence & IaC Policy Validation
+- Remote encrypted state with Object Versioning & Lifecycle (GCS bucket or R2 S3 backend).
+- Never store plaintext secrets in terraform.tfstate; mark secret variables `sensitive = true`.
+- Gate `terraform apply` in CI with `terraform show -json tfplan > tfplan.json` + `gcloud beta terraform vet tfplan.json --policy-library=./policy-library` (fails on exit code 2).
+
+## 2. Security, Privacy & OWASP Top 10:2025 Compliance
+- Keyless CI/CD via Workload Identity Federation (`iam.disableServiceAccountKeyCreation = true`).
+- Disable automatic default SA IAM grants (`iam.automaticIamGrantsForDefaultServiceAccounts = true`).
+- Enforce TLS 1.2+ via `constraints/gcp.restrictTLSVersion` (deny TLS 1.0 / TLS 1.1) and OkHttp `ConnectionSpec.MODERN_TLS`.
+- Protect Firebase/LLM endpoints with Firebase App Check + GenAI Model Armor / DLP redaction.
+- Never place API keys in URL query strings; always use `x-goog-api-key` and `x-goog-user-project` HTTP headers.
+- Secret Manager automatic 90-day rotation schedule (`rotation_period = "7776000s"`).
+
+## 3. Reliability, Quotas & Endpoint Governance
+- Enable `cloudquotas.googleapis.com` and Cloud Monitoring Consumer Quota alerts (`serviceruntime.googleapis.com/quota/allocation/usage >= 80%`).
+- For strict residency / FedRAMP workloads: enforce `constraints/gcp.restrictEndpointUsage` + `AGY_CLI_DISABLE_AUTO_UPDATE=true` + regional endpoints.
+
+## 4. Cost Optimization & Sustainability
+- Scale-to-zero Cloud Run (`min_instance_count = 0`, `cpu_idle = true`) + $0.10/day ($3/mo) Budget Pub/Sub circuit breaker.
+- Compare Spend-Based CUDs only after sustained baseline utilization; stay inside Always Free + Frugal AI routing first.
+
+## 5. Multi-Platform Official Docs Alignment (Cloudflare / Firebase / GitHub / Terraform)
+- Cloudflare Workers: Use `crypto.subtle.timingSafeEqual` for secret comparison; set `workers_dev = false` when serving exclusively via custom domain routes.
+- Firebase Auth & App Check: Always verify `RS256` signature via `securetoken@system.gserviceaccount.com` JWK + `iss`/`aud`/`sub`/`iat`/`exp` claims on Worker; use Play Integrity API for Google Play production Android releases.
+- GitHub REST & Actions: Send `X-GitHub-Api-Version: 2022-11-28` on all REST calls; restrict top-level workflow `permissions: {}`, define `concurrency`, and set `timeout-minutes`.
+- Terraform Google v6+: Explicitly set `deletion_protection`, apply provider `default_labels`, protect stateful buckets/KV with `lifecycle { prevent_destroy }`, and avoid persisting secrets inside `tfstate`.
 """
         )
     ) + OrchestrationTemplates.all

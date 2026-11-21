@@ -37,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.model.AskRagResult
 import com.example.model.OrchestrationHardeningState
 
 @Composable
@@ -54,7 +55,12 @@ fun OrchestrationHardeningPanel(
     onTriggerAutoTune: () -> Unit = {},
     onCreateDrSnapshot: () -> Unit = {},
     onRestoreDrSnapshot: () -> Unit = {},
-    onPingDeadmanSwitch: () -> Unit = {}
+    onPingDeadmanSwitch: () -> Unit = {},
+    onRegisterBiometricKey: () -> Unit = {},
+    lastAskResult: AskRagResult? = null,
+    isAskingRag: Boolean = false,
+    onAskAuditRag: (String) -> Unit = {},
+    onShowMessage: (String) -> Unit = {}
 ) {
     Card(
         colors = CardDefaults.cardColors(
@@ -251,7 +257,15 @@ fun OrchestrationHardeningPanel(
                 onTriggerAutoTune = onTriggerAutoTune,
                 onCreateDrSnapshot = onCreateDrSnapshot,
                 onRestoreDrSnapshot = onRestoreDrSnapshot,
-                onPingDeadmanSwitch = onPingDeadmanSwitch
+                onPingDeadmanSwitch = onPingDeadmanSwitch,
+                onRegisterBiometricKey = onRegisterBiometricKey,
+                onShowMessage = onShowMessage
+            )
+
+            AuditRagQueryCard(
+                lastResult = lastAskResult,
+                isBusy = isAskingRag,
+                onAskQuestion = onAskAuditRag
             )
 
             // 3. Pending One-Time Approvals (30m TTL)
@@ -295,6 +309,30 @@ fun OrchestrationHardeningPanel(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                            }
+                            if (item.criticRiskLevel.isNotBlank() || item.criticWarnings.isNotEmpty()) {
+                                val risk = item.criticRiskLevel.ifBlank { "WARN" }
+                                val isHigh = risk.equals("HIGH", ignoreCase = true)
+                                Surface(
+                                    color = if (isHigh) {
+                                        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                                    } else {
+                                        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = "Critic [$risk]: ${item.criticWarnings.joinToString(" / ").ifBlank { "安全レビュー済み" }}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isHigh) {
+                                            MaterialTheme.colorScheme.onErrorContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.onSecondaryContainer
+                                        },
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
                             }
                             Row(
                                 modifier = Modifier.fillMaxWidth(),

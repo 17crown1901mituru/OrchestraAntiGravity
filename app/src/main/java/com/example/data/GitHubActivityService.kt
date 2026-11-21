@@ -7,6 +7,7 @@ import com.example.model.GitHubSyncStatus
 import com.example.model.SyncHealthState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -23,6 +24,7 @@ class GitHubActivityService(
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT))
         .build(),
     private val apiBaseUrl: String = "https://api.github.com"
 ) {
@@ -279,6 +281,7 @@ class GitHubActivityService(
         val builder = Request.Builder()
             .url(url)
             .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
             .get()
         if (pat.isNotBlank()) {
             builder.header("Authorization", "Bearer $pat")

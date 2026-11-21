@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">AntiGravity Hub</string>
+    <string name="widget_status_description">稼働モード・承認待ち件数・KV/AI 無料枠残量を表示し、ワンタップで最新状態へ更新します。</string>
+    <string name="qs_tile_killswitch_label">AntiGravity KillSwitch</string>
+    <string name="biometric_approval_title">ゼロトラスト生体署名承認</string>
+    <string name="biometric_approval_subtitle">StrongBox / TEE 秘密鍵でワンタイムチャレンジに電子署名します</string>
 </resources>

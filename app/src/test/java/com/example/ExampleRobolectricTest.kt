@@ -455,7 +455,7 @@ class ExampleRobolectricTest {
     }.apply { start() }
 
     try {
-      val crawler = WebContextCrawler(context)
+      val crawler = WebContextCrawler(context, allowLoopbackForTest = true)
       assertEquals("https://google.com", crawler.normalizeUrlOrDomain("google.com"))
 
       val res = crawler.crawlAndCapture(
