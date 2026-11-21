@@ -33,7 +33,7 @@ class FirestoreRepository(
 ) {
     constructor(context: Context) : this(
         FirebaseFirestore.getInstance(
-            context.applicationContext.getString(R.string.firestore_database_id)
+            RuntimeCloudBootstrapStore.resolveDatabaseId(context)
         )
     )
 

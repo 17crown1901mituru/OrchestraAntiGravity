@@ -14,6 +14,7 @@ import com.example.data.LocalSecretsStore
 import com.example.data.MultimodalSourceLoader
 import com.example.data.OrchestrationExtendedClient
 import com.example.data.OrchestrationHardeningClient
+import com.example.data.RuntimeCloudBootstrapStore
 import com.example.data.StackTemplates
 import com.example.data.SyncSnapshotStore
 import com.example.data.WebContextCrawler
@@ -225,10 +226,11 @@ class HubViewModel(
     private val _isAskingRag = MutableStateFlow(false)
     val isAskingRag: StateFlow<Boolean> = _isAskingRag.asStateFlow()
 
-    private val _credentials = MutableStateFlow(secretsStore.loadForUser(currentUserId))
+    private val _vaultMetadata = MutableStateFlow(secretsStore.getVaultMetadata(currentUserId, userEmail))
+
+    private val _credentials = MutableStateFlow(enrichFromRuntimeBootstrap(secretsStore.loadForUser(currentUserId)))
     val credentials: StateFlow<ExternalCredentials> = _credentials.asStateFlow()
 
-    private val _vaultMetadata = MutableStateFlow(secretsStore.getVaultMetadata(currentUserId, userEmail))
     val vaultMetadata: StateFlow<VaultMetadata> = _vaultMetadata.asStateFlow()
 
     private val _statusBanner = MutableStateFlow<String?>(null)
@@ -278,15 +280,37 @@ class HubViewModel(
             )
             val savedCreds = _credentials.value
             val snap = syncSnapshotStore.loadSnapshot(currentUserId)
-            val hasCloudKeys = savedCreds.githubPat.isNotBlank() ||
+            val hasCloudTargets = savedCreds.githubPat.isNotBlank() ||
                 savedCreds.githubOwnerRepo.isNotBlank() ||
-                savedCreds.cloudflareApiToken.isNotBlank()
-            if (hasCloudKeys && snap.syncedAtEpochMs == 0L) {
+                savedCreds.cloudflareApiToken.isNotBlank() ||
+                savedCreds.gc2223Endpoint.isNotBlank()
+            if (hasCloudTargets && snap.syncedAtEpochMs == 0L) {
                 BackgroundSyncScheduler.triggerImmediateSync(applicationContext, currentUserId)
             } else if (snap.termuxSyncedAtEpochMs == 0L) {
                 BackgroundSyncScheduler.triggerImmediateTermuxSync(applicationContext, currentUserId)
             }
         }
+    }
+
+    private fun enrichFromRuntimeBootstrap(loaded: ExternalCredentials): ExternalCredentials {
+        val bootstrap = runCatching { RuntimeCloudBootstrapStore(applicationContext).load() }.getOrNull()
+            ?: return loaded
+        val hasVault = _vaultMetadata.value.hasStoredSecrets
+        val effectiveGateway = when {
+            bootstrap.gatewayUrl.isNotBlank() && (!hasVault || loaded.gc2223Endpoint == "https://gc2223.com") ->
+                bootstrap.gatewayUrl
+            else -> loaded.gc2223Endpoint
+        }
+        val effectiveRepo = loaded.githubOwnerRepo.ifBlank { bootstrap.defaultGithubRepo }
+        val effectiveProject = when {
+            bootstrap.firebaseProjectId.isNotBlank() && !hasVault -> bootstrap.firebaseProjectId
+            else -> loaded.gcpProjectId
+        }
+        return loaded.copy(
+            gc2223Endpoint = effectiveGateway,
+            githubOwnerRepo = effectiveRepo,
+            gcpProjectId = effectiveProject
+        )
     }
 
     private fun unwrapFirestoreError(error: Throwable, fallback: String): String {
@@ -440,12 +464,16 @@ class HubViewModel(
             _isBusyNodeAction.value = true
             try {
                 val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
                 val res = bridgeClient.commitFileToGitHub(
                     pat = creds.githubPat,
                     ownerRepo = creds.githubOwnerRepo,
                     filePath = filePath,
                     content = content,
-                    commitMessage = commitMessage
+                    commitMessage = commitMessage,
+                    gatewayUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
                 )
                 _statusBanner.value = res.message
             } finally {
@@ -463,19 +491,23 @@ class HubViewModel(
             _isBusyNodeAction.value = true
             try {
                 val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
                 val res = bridgeClient.dispatchTerraformWorkflow(
                     pat = creds.githubPat,
                     ownerRepo = creds.githubOwnerRepo,
                     workflowFile = workflowFile,
                     action = action,
-                    targetEnv = targetEnv
+                    targetEnv = targetEnv,
+                    gatewayUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
                 )
                 if (res.success) {
                     repository.addCostEntry(
                         userId = currentUserId,
                         provider = "GITHUB",
                         amountUsd = 0.0,
-                        usageSummary = "Terraform ${action.cliValue} ($targetEnv) on ${creds.githubOwnerRepo}",
+                        usageSummary = "Terraform ${action.cliValue} ($targetEnv) on ${creds.githubOwnerRepo.ifBlank { "sso-default" }}",
                         source = "AUTO_TELEMETRY"
                     )
                 }
@@ -492,6 +524,7 @@ class HubViewModel(
             _isBusyNodeAction.value = true
             try {
                 val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
                 val targets = listOf(
                     "terraform_llm_infra" to "infra/main.tf",
                     "governance_policy_json" to "governance-policy.json",
@@ -510,7 +543,10 @@ class HubViewModel(
                         ownerRepo = creds.githubOwnerRepo,
                         filePath = path,
                         content = tpl.content,
-                        commitMessage = "chore(antigravity): bootstrap orchestration stack ($path)"
+                        commitMessage = "chore(antigravity): bootstrap orchestration stack ($path)",
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = idToken
                     )
                     if (res.success) {
                         successCount++
@@ -934,7 +970,10 @@ class HubViewModel(
                 val res = bridgeClient.rerunFailedGitHubWorkflow(
                     pat = creds.githubPat,
                     ownerRepo = creds.githubOwnerRepo,
-                    runId = runId
+                    runId = runId,
+                    gatewayUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = fetchFirebaseIdToken()
                 )
                 _selfHealReport.value = res.message
                 _statusBanner.value = res.message
@@ -960,6 +999,7 @@ class HubViewModel(
                 val creds = _credentials.value
                 val effectiveRepo = repoOverride.ifBlank { creds.githubOwnerRepo }
                 val effectiveWorkflow = workflowFile.ifBlank { creds.githubWorkflowFile }
+                val idToken = fetchFirebaseIdToken()
 
                 val prompt = buildString {
                     appendLine("You are AntiGravity Self-Heal Engineer.")
@@ -986,7 +1026,7 @@ class HubViewModel(
                     val emailRes = bridgeClient.triggerEmailSelfHealWorker(
                         baseUrl = creds.gc2223Endpoint,
                         bearerToken = creds.gc2223BearerToken,
-                        firebaseIdToken = fetchFirebaseIdToken(),
+                        firebaseIdToken = idToken,
                         recipientEmail = costConfigState.value.alertEmail.ifBlank { userEmail },
                         ownerRepo = effectiveRepo,
                         workflowFile = effectiveWorkflow,
@@ -1004,7 +1044,10 @@ class HubViewModel(
                         bridgeClient.rerunFailedGitHubWorkflow(
                             pat = creds.githubPat,
                             ownerRepo = effectiveRepo,
-                            runId = runId
+                            runId = runId,
+                            gatewayUrl = creds.gc2223Endpoint,
+                            bearerToken = creds.gc2223BearerToken,
+                            firebaseIdToken = idToken
                         )
                     } else {
                         bridgeClient.dispatchGitHubWorkflow(
@@ -1014,7 +1057,10 @@ class HubViewModel(
                             inputs = mapOf(
                                 "triggered_by" to "antigravity-self-heal",
                                 "retry_count" to (retryCount + 1).toString()
-                            )
+                            ),
+                            gatewayUrl = creds.gc2223Endpoint,
+                            bearerToken = creds.gc2223BearerToken,
+                            firebaseIdToken = idToken
                         )
                     }
                     reportLines.add("\n### ワークフロー再実行")
@@ -1091,7 +1137,8 @@ class HubViewModel(
                 _statusBanner.value = "AES-256-GCM 暗号化ボルトに保存しました (${meta.linkedEmail.ifBlank { currentUserId }})"
                 val hasCloudTargets = updated.githubPat.isNotBlank() ||
                     updated.githubOwnerRepo.isNotBlank() ||
-                    updated.cloudflareApiToken.isNotBlank()
+                    updated.cloudflareApiToken.isNotBlank() ||
+                    updated.gc2223Endpoint.isNotBlank()
                 if (syncSettingsState.value.enabled) {
                     if (hasCloudTargets) {
                         BackgroundSyncScheduler.triggerImmediateSync(applicationContext, currentUserId)
@@ -1108,8 +1155,8 @@ class HubViewModel(
     fun clearEncryptedVault() {
         secretsStore.clearForUser(currentUserId, userEmail)
             .onSuccess { meta ->
-                _credentials.value = ExternalCredentials()
                 _vaultMetadata.value = meta
+                _credentials.value = enrichFromRuntimeBootstrap(ExternalCredentials())
                 _settingsVerificationStatus.value = null
                 syncSnapshotStore.saveSnapshot(currentUserId, SyncStatusSnapshot(userId = currentUserId))
                 _statusBanner.value = "暗号化ボルトの保存キーをすべて消去しました"
@@ -1123,9 +1170,22 @@ class HubViewModel(
         viewModelScope.launch {
             _isBusyNodeAction.value = true
             try {
-                val res = bridgeClient.verifyGitHubPat(pat)
-                _settingsVerificationStatus.value = res.message
-                _statusBanner.value = res.message
+                val creds = _credentials.value
+                val msg = if (pat.isNotBlank()) {
+                    bridgeClient.verifyGitHubPat(pat).message
+                } else {
+                    val status = bridgeClient.fetchGitHubSyncStatus(
+                        pat = "",
+                        ownerRepo = creds.githubOwnerRepo,
+                        workflowFile = creds.githubWorkflowFile,
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = fetchFirebaseIdToken()
+                    )
+                    status.summaryMessage
+                }
+                _settingsVerificationStatus.value = msg
+                _statusBanner.value = msg
             } finally {
                 _isBusyNodeAction.value = false
             }
@@ -1136,9 +1196,21 @@ class HubViewModel(
         viewModelScope.launch {
             _isBusyNodeAction.value = true
             try {
-                val res = bridgeClient.verifyCloudflareToken(token)
-                _settingsVerificationStatus.value = res.message
-                _statusBanner.value = res.message
+                val creds = _credentials.value
+                val msg = if (token.isNotBlank()) {
+                    bridgeClient.verifyCloudflareToken(token).message
+                } else {
+                    val status = bridgeClient.fetchCloudflareSyncStatus(
+                        apiToken = "",
+                        accountId = creds.cloudflareAccountId,
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = fetchFirebaseIdToken()
+                    )
+                    status.summaryMessage
+                }
+                _settingsVerificationStatus.value = msg
+                _statusBanner.value = msg
             } finally {
                 _isBusyNodeAction.value = false
             }
@@ -1411,16 +1483,33 @@ class HubViewModel(
             _isBusyNodeAction.value = true
             try {
                 val creds = _credentials.value
-                val res = bridgeClient.verifyCloudflareToken(creds.cloudflareApiToken)
-                val newStatus = if (res.success) "ACTIVE" else "ERROR"
+                val idToken = fetchFirebaseIdToken()
+                val (newStatus, note) = if (creds.cloudflareApiToken.isNotBlank()) {
+                    val res = bridgeClient.verifyCloudflareToken(creds.cloudflareApiToken)
+                    (if (res.success) "ACTIVE" else "ERROR") to res.message
+                } else {
+                    val cfStatus = bridgeClient.fetchCloudflareSyncStatus(
+                        apiToken = "",
+                        accountId = creds.cloudflareAccountId,
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = idToken
+                    )
+                    val st = when (cfStatus.health) {
+                        com.example.model.SyncHealthState.CONNECTED -> "ACTIVE"
+                        com.example.model.SyncHealthState.ERROR -> "ERROR"
+                        else -> "CONFIGURED"
+                    }
+                    st to cfStatus.summaryMessage
+                }
                 repository.updateNodeStatus(
                     userId = currentUserId,
                     nodeId = node.id,
                     status = newStatus,
                     endpointOrTarget = creds.gc2223Endpoint,
-                    lastCheckedNote = res.message
+                    lastCheckedNote = note
                 )
-                _statusBanner.value = res.message
+                _statusBanner.value = note
             } finally {
                 _isBusyNodeAction.value = false
             }
@@ -1432,34 +1521,51 @@ class HubViewModel(
             _isBusyNodeAction.value = true
             try {
                 val creds = _credentials.value
-                val res = if (dispatch) {
-                    bridgeClient.dispatchGitHubWorkflow(
+                val idToken = fetchFirebaseIdToken()
+                var targetRepoResolved = creds.githubOwnerRepo.ifBlank { node.endpointOrTarget }
+                val (ok, note) = if (dispatch) {
+                    val res = bridgeClient.dispatchGitHubWorkflow(
                         pat = creds.githubPat,
                         ownerRepo = creds.githubOwnerRepo,
-                        workflowFile = creds.githubWorkflowFile
+                        workflowFile = creds.githubWorkflowFile,
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = idToken
                     )
+                    res.success to res.message
+                } else if (creds.githubPat.isNotBlank()) {
+                    val res = bridgeClient.verifyGitHubPat(creds.githubPat)
+                    res.success to res.message
                 } else {
-                    bridgeClient.verifyGitHubPat(creds.githubPat)
+                    val ghStatus = bridgeClient.fetchGitHubSyncStatus(
+                        pat = "",
+                        ownerRepo = creds.githubOwnerRepo,
+                        workflowFile = creds.githubWorkflowFile,
+                        gatewayUrl = creds.gc2223Endpoint,
+                        bearerToken = creds.gc2223BearerToken,
+                        firebaseIdToken = idToken
+                    )
+                    if (ghStatus.targetRepo.isNotBlank()) targetRepoResolved = ghStatus.targetRepo
+                    (ghStatus.health == com.example.model.SyncHealthState.CONNECTED) to ghStatus.summaryMessage
                 }
-                val newStatus = if (res.success) "ACTIVE" else "ERROR"
-                val target = creds.githubOwnerRepo.ifBlank { node.endpointOrTarget }
+                val newStatus = if (ok) "ACTIVE" else "ERROR"
                 repository.updateNodeStatus(
                     userId = currentUserId,
                     nodeId = node.id,
                     status = newStatus,
-                    endpointOrTarget = target,
-                    lastCheckedNote = res.message
+                    endpointOrTarget = targetRepoResolved,
+                    lastCheckedNote = note
                 )
-                if (dispatch && res.success) {
+                if (dispatch && ok) {
                     repository.addCostEntry(
                         userId = currentUserId,
                         provider = "GITHUB",
                         amountUsd = 0.0,
-                        usageSummary = "workflow_dispatch: ${creds.githubOwnerRepo}",
+                        usageSummary = "workflow_dispatch: ${targetRepoResolved}",
                         source = "AUTO_TELEMETRY"
                     )
                 }
-                _statusBanner.value = res.message
+                _statusBanner.value = note
             } finally {
                 _isBusyNodeAction.value = false
             }

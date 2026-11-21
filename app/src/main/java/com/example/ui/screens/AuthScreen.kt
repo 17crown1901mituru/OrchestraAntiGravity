@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CloudDone
+import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Terminal
@@ -35,6 +36,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -60,17 +62,27 @@ import androidx.lifecycle.lifecycleScope
 import com.example.R
 import com.example.auth.attemptAutoSignIn
 import com.example.auth.onGoogleSignInClicked
+import com.example.data.RuntimeCloudBootstrapStore
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AuthScreen(
-    onAuthSuccess: () -> Unit
+    onAuthSuccess: () -> Unit,
+    onOpenRuntimeConfig: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val fallbackScope = rememberCoroutineScope()
     val authScope = (context as? ComponentActivity)?.lifecycleScope ?: fallbackScope
     val credentialManager = remember(context) { CredentialManager.create(context) }
+    val bootstrapConfig = remember(context) { RuntimeCloudBootstrapStore(context).load() }
+    val workerLabel = remember(bootstrapConfig.gatewayUrl) {
+        bootstrapConfig.gatewayUrl
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .trimEnd('/')
+            .ifBlank { "Cloudflare Worker" }
+    }
 
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -156,7 +168,7 @@ fun AuthScreen(
             }
 
             Text(
-                text = "Firebase・Cloudflare (gc2223.com)・GitHub・GCP の無料枠を統合し、Termux の AntiGravityAgent CLI へ接続するコントロールプレーン。",
+                text = "起動時の Google アカウントログインだけで、Firebase・Cloudflare Worker・GitHub Actions・GCP・Termux を単一 SSO セッションで統合連携します。",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -181,8 +193,8 @@ fun AuthScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        StackPill(Icons.Rounded.AutoAwesome, "Gemini 3.8 Flash")
-                        StackPill(Icons.Rounded.CloudDone, "gc2223.com Worker")
+                        StackPill(Icons.Rounded.AutoAwesome, "Google SSO Broker")
+                        StackPill(Icons.Rounded.CloudDone, workerLabel)
                         StackPill(Icons.Rounded.Code, "GitHub Actions")
                         StackPill(Icons.Rounded.Security, "GCP $0.10/d Guard")
                         StackPill(Icons.Rounded.Terminal, "Termux CLI")
@@ -251,8 +263,26 @@ fun AuthScreen(
                 }
             }
 
+            OutlinedButton(
+                onClick = onOpenRuntimeConfig,
+                enabled = !isLoading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("auth_runtime_config_button"),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.CloudSync,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("接続先 / Firebase 設定を変更 (Gateway URL)")
+            }
+
             Text(
-                text = "※ 17crown2223@gmail.com などの Google アカウントでサインインすると、Android Keystore 暗号化ボルトとユーザー専用 Firestore が有効になります。",
+                text = "※ Google アカウントでサインインすると、Android Keystore AES-256-GCM ボルト・専用 Firestore・Cloudflare Worker 経由の GitHub / Cloudflare SSO ブローカーが自動有効化されます（APK への秘密情報埋め込み不要）。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

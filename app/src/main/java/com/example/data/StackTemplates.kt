@@ -33,6 +33,21 @@ export default {
       });
     }
 
+    // 2b. Public non-secret Firebase runtime bootstrap endpoint (no secrets exposed)
+    if (url.pathname === "/v1/client-config" && request.method === "GET") {
+      return Response.json({
+        ok: true,
+        gatewayUrl: url.origin,
+        firebaseProjectId: env.FIREBASE_PROJECT_ID || "",
+        firebaseAppId: env.FIREBASE_APP_ID || "",
+        firebaseApiKey: env.FIREBASE_API_KEY || "",
+        firebaseWebClientId: env.FIREBASE_WEB_CLIENT_ID || "",
+        firestoreDatabaseId: env.FIRESTORE_DATABASE_ID || "(default)",
+        storageBucket: env.FIREBASE_STORAGE_BUCKET || "",
+        defaultGithubRepo: env.DEFAULT_GITHUB_REPO || ""
+      });
+    }
+
     // 3. Seamless SSO + Timing-Safe Bearer Auth Guard
     const auth = request.headers.get("Authorization") || "";
     const fbToken = request.headers.get("X-Firebase-Token") || "";
@@ -89,9 +104,24 @@ export default {
       return Response.json({ sent: mailRes.ok, status: mailRes.status });
     }
 
-    // 6. GitHub Actions remote dispatch (/v1/dispatch-github)
+    // 6. Google SSO Broker Status (/v1/sso/status) -> Cloudflare + GitHub with zero secrets on APK
+    if (url.pathname === "/v1/sso/status" && request.method === "GET") {
+      const targetRepo = (url.searchParams.get("repo") || env.DEFAULT_GITHUB_REPO || "").trim();
+      const targetWf = (url.searchParams.get("workflow") || "antigravity-deploy.yml").trim();
+      const status = await buildSsoStatusSnapshot(env, targetRepo, targetWf, ssoUser?.email || "bearer-client");
+      return Response.json({ ok: true, userEmail: ssoUser?.email || "", ...status });
+    }
+
+    // 7. GitHub Actions remote dispatch (/v1/dispatch-github)
     if (url.pathname === "/v1/dispatch-github" && request.method === "POST") {
-      const { repo, workflow = "antigravity-deploy.yml", ref = "main" } = await request.json();
+      const body = await request.json().catch(() => ({}));
+      const repo = (body.repo || env.DEFAULT_GITHUB_REPO || "").trim();
+      const workflow = (body.workflow || "antigravity-deploy.yml").trim();
+      const ref = (body.ref || "main").trim();
+      const inputs = body.inputs && typeof body.inputs === "object" ? body.inputs : undefined;
+      if (!env.GITHUB_PAT || !repo) {
+        return Response.json({ dispatched: false, status: 400, error: "GITHUB_PAT or repo missing" }, { status: 400 });
+      }
       const ghRes = await fetch(
         `https://api.github.com/repos/${'$'}{repo}/actions/workflows/${'$'}{workflow}/dispatches`,
         {
@@ -102,15 +132,145 @@ export default {
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "AntiGravityAgent-Worker"
           },
-          body: JSON.stringify({ ref })
+          body: JSON.stringify(inputs ? { ref, inputs } : { ref })
         }
       );
-      return Response.json({ dispatched: ghRes.status === 204, status: ghRes.status });
+      const errText = ghRes.status === 204 ? "" : await ghRes.text().catch(() => "");
+      return Response.json({ dispatched: ghRes.status === 204, status: ghRes.status, error: errText.slice(0, 200) }, { status: ghRes.status === 204 ? 200 : ghRes.status });
+    }
+
+    // 8. GitHub File Commit via Google SSO Broker (/v1/github/commit-file)
+    if (url.pathname === "/v1/github/commit-file" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const repo = (body.repo || env.DEFAULT_GITHUB_REPO || "").trim();
+      const filePath = String(body.path || "").replace(/^\/+/, "");
+      const content = String(body.content || "");
+      const message = String(body.message || `chore: update ${'$'}{filePath}`);
+      const branch = String(body.branch || "main");
+      if (!env.GITHUB_PAT || !repo || !filePath) {
+        return Response.json({ ok: false, error: "GITHUB_PAT, repo, and path are required" }, { status: 400 });
+      }
+      const ghHeaders = {
+        "Authorization": `Bearer ${'$'}{env.GITHUB_PAT}`,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "AntiGravityAgent-Worker"
+      };
+      const apiUrl = `https://api.github.com/repos/${'$'}{repo}/contents/${'$'}{filePath}`;
+      let existingSha = undefined;
+      const getRes = await fetch(`${'$'}{apiUrl}?ref=${'$'}{encodeURIComponent(branch)}`, { headers: ghHeaders });
+      if (getRes.ok) {
+        const existingJson = await getRes.json().catch(() => ({}));
+        if (existingJson?.sha) existingSha = existingJson.sha;
+      }
+      const contentBytes = new TextEncoder().encode(content);
+      let bin = "";
+      for (const b of contentBytes) bin += String.fromCharCode(b);
+      const putRes = await fetch(apiUrl, {
+        method: "PUT",
+        headers: { ...ghHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ message, content: btoa(bin), branch, ...(existingSha ? { sha: existingSha } : {}) })
+      });
+      const putJson = await putRes.json().catch(() => ({}));
+      if (!putRes.ok) {
+        return Response.json({ ok: false, error: putJson?.message || `HTTP ${'$'}{putRes.status}` }, { status: putRes.status });
+      }
+      return Response.json({ ok: true, commitSha: putJson?.commit?.sha || "", path: filePath, branch });
+    }
+
+    // 9. GitHub Rerun Failed Jobs via Google SSO Broker (/v1/github/rerun)
+    if (url.pathname === "/v1/github/rerun" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const repo = (body.repo || env.DEFAULT_GITHUB_REPO || "").trim();
+      const runId = Number(body.runId || 0);
+      if (!env.GITHUB_PAT || !repo || !runId) {
+        return Response.json({ ok: false, error: "GITHUB_PAT, repo, and runId are required" }, { status: 400 });
+      }
+      const ghRes = await fetch(`https://api.github.com/repos/${'$'}{repo}/actions/runs/${'$'}{runId}/rerun-failed-jobs`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${'$'}{env.GITHUB_PAT}`,
+          "Accept": "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "AntiGravityAgent-Worker"
+        }
+      });
+      return Response.json({ ok: ghRes.status === 201 || ghRes.ok, status: ghRes.status }, { status: ghRes.ok || ghRes.status === 201 ? 200 : ghRes.status });
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 };
+
+async function buildSsoStatusSnapshot(env, targetRepo, workflowFile, userEmail) {
+  const cf = { tokenConfigured: Boolean(env.CLOUDFLARE_API_TOKEN), tokenStatus: env.CLOUDFLARE_API_TOKEN ? "sso-broker" : "unconfigured", accountId: env.CLOUDFLARE_ACCOUNT_ID || "", accountName: "", workerCount: 0, workers: [], summaryMessage: "" };
+  if (env.CLOUDFLARE_API_TOKEN) {
+    const cfHdr = { "Authorization": `Bearer ${'$'}{env.CLOUDFLARE_API_TOKEN}` };
+    if (!cf.accountId) {
+      const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", { headers: cfHdr }).catch(() => null);
+      if (accRes?.ok) {
+        const accJson = await accRes.json().catch(() => ({}));
+        const firstAcc = accJson?.result?.[0];
+        if (firstAcc) { cf.accountId = firstAcc.id || ""; cf.accountName = firstAcc.name || ""; }
+      }
+    }
+    if (cf.accountId) {
+      const wRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${'$'}{cf.accountId}/workers/scripts`, { headers: cfHdr }).catch(() => null);
+      if (wRes?.ok) {
+        const wJson = await wRes.json().catch(() => ({}));
+        cf.workers = (wJson?.result || []).slice(0, 10).map((w) => ({ scriptId: w.id, modifiedOn: w.modified_on || "" }));
+        cf.workerCount = (wJson?.result || []).length;
+      }
+    }
+    cf.summaryMessage = `Google SSO 連携済み (${'$'}{userEmail}) • ${'$'}{cf.workerCount} Worker(s)`;
+  } else {
+    cf.summaryMessage = "Gateway SSO OK (CLOUDFLARE_API_TOKEN 未設定)";
+  }
+
+  const gh = { configured: Boolean(env.GITHUB_PAT), accountLogin: "", targetRepo, defaultBranch: "main", isPrivate: false, openIssuesCount: 0, openPullRequestsCount: 0, starsCount: 0, pushedAt: "", workflowName: workflowFile, workflowStatus: "", workflowConclusion: "", workflowUpdatedAt: "", workflowRunId: 0, workflowRunUrl: "", recentCommits: [], recentEvents: [], summaryMessage: "" };
+  if (env.GITHUB_PAT && targetRepo.includes("/")) {
+    const ghHdr = { "Authorization": `Bearer ${'$'}{env.GITHUB_PAT}`, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "AntiGravityAgent-Worker" };
+    const [repoRes, runsRes, commitsRes] = await Promise.all([
+      fetch(`https://api.github.com/repos/${'$'}{targetRepo}`, { headers: ghHdr }).catch(() => null),
+      fetch(`https://api.github.com/repos/${'$'}{targetRepo}/actions/runs?per_page=1`, { headers: ghHdr }).catch(() => null),
+      fetch(`https://api.github.com/repos/${'$'}{targetRepo}/commits?per_page=3`, { headers: ghHdr }).catch(() => null)
+    ]);
+    if (repoRes?.ok) {
+      const rJson = await repoRes.json().catch(() => ({}));
+      gh.accountLogin = rJson?.owner?.login || targetRepo.split("/")[0];
+      gh.defaultBranch = rJson?.default_branch || "main";
+      gh.isPrivate = Boolean(rJson?.private);
+      gh.openIssuesCount = Number(rJson?.open_issues_count || 0);
+      gh.starsCount = Number(rJson?.stargazers_count || 0);
+      gh.pushedAt = rJson?.pushed_at || "";
+    }
+    if (runsRes?.ok) {
+      const wJson = await runsRes.json().catch(() => ({}));
+      const latest = wJson?.workflow_runs?.[0];
+      if (latest) {
+        gh.workflowName = latest.name || workflowFile;
+        gh.workflowStatus = latest.status || "";
+        gh.workflowConclusion = latest.conclusion || "";
+        gh.workflowUpdatedAt = latest.updated_at || "";
+        gh.workflowRunId = Number(latest.id || 0);
+        gh.workflowRunUrl = latest.html_url || "";
+      }
+    }
+    if (commitsRes?.ok) {
+      const cArr = await commitsRes.json().catch(() => []);
+      gh.recentCommits = (Array.isArray(cArr) ? cArr : []).map((c) => ({
+        sha: String(c?.sha || "").slice(0, 7),
+        message: String(c?.commit?.message || "").split("\n")[0],
+        author: c?.commit?.author?.name || "",
+        committedAt: c?.commit?.author?.date || ""
+      }));
+    }
+    gh.summaryMessage = `SSO経由: ${'$'}{targetRepo} (${'$'}{gh.workflowConclusion || gh.workflowStatus || "connected"})`;
+  } else {
+    gh.summaryMessage = env.GITHUB_PAT ? "Repo 未指定" : "Worker 側に GITHUB_PAT 未設定";
+  }
+  return { cloudflare: cf, github: gh };
+}
 
 function timingSafeEqualStrings(a, b) {
   const enc = new TextEncoder();
@@ -216,7 +376,13 @@ routes = [
 
 [vars]
 FIREBASE_PROJECT_ID = "gen-lang-client-0439741065"
+FIREBASE_APP_ID = "YOUR_MOBILE_SDK_APP_ID"
+FIREBASE_API_KEY = "YOUR_FIREBASE_WEB_API_KEY"
+FIREBASE_WEB_CLIENT_ID = "YOUR_OAUTH_WEB_CLIENT_ID.apps.googleusercontent.com"
+FIRESTORE_DATABASE_ID = "(default)"
+DEFAULT_GITHUB_REPO = "17crown1901mituru/OrchestraAntiGravity"
 ALERT_FROM_EMAIL = "alerts@gc2223.com"
+ALLOWED_FIREBASE_EMAIL = "17crown2223@gmail.com"
 
 [ai]
 binding = "AI"
@@ -224,9 +390,11 @@ binding = "AI"
 [triggers]
 crons = ["0 */6 * * *"]
 
-# Set secrets via CLI (never commit to git):
+# Set secrets via CLI (never commit to git or bundle in APK):
 # npx wrangler secret put AGENT_BEARER_TOKEN
 # npx wrangler secret put GITHUB_PAT
+# npx wrangler secret put CLOUDFLARE_API_TOKEN
+# npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
 # npx wrangler secret put RESEND_API_KEY
 """
         ),

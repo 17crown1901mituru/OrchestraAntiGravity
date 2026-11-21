@@ -88,7 +88,7 @@ jobs:
               printf '%s' "${GOOGLE_SERVICES_JSON}" > app/google-services.json
               echo "Restored app/google-services.json from GOOGLE_SERVICES_JSON secret."
             else
-              echo "::warning::app/google-services.json not found in repo or Secrets. APK will build, but Google Sign-In/Firebase require google-services.json."
+              echo "::notice::app/google-services.json not found in repo or Secrets. Zero-secret APK will build and initialize Firebase at runtime via Gateway /v1/client-config or manual/JSON bootstrap."
             fi
           fi
 

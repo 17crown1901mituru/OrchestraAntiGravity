@@ -9,6 +9,7 @@ import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import com.example.BuildConfig
+import com.example.data.RuntimeCloudBootstrapStore
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -141,6 +142,11 @@ fun signOutUser(
 }
 
 internal fun resolveDefaultWebClientId(context: Context): String? {
+    val runtimeClientId = runCatching {
+        RuntimeCloudBootstrapStore(context).load().firebaseWebClientId.trim()
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+    if (runtimeClientId != null) return runtimeClientId
+
     val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
     val fromGoogleServices = if (resId != 0) {
         runCatching { context.getString(resId).trim() }

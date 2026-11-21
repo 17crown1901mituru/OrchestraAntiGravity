@@ -65,7 +65,10 @@ class CloudStatusSyncWorker(
                     bridgeClient.fetchGitHubSyncStatus(
                         pat = credentials.githubPat,
                         ownerRepo = credentials.githubOwnerRepo,
-                        workflowFile = credentials.githubWorkflowFile
+                        workflowFile = credentials.githubWorkflowFile,
+                        gatewayUrl = credentials.gc2223Endpoint,
+                        bearerToken = credentials.gc2223BearerToken,
+                        firebaseIdToken = idToken
                     )
                 }
                 val cfDeferred = async {
@@ -92,7 +95,7 @@ class CloudStatusSyncWorker(
             // Sync node status into Firestore when signed into the matching Firebase Auth session
             if (currentFirebaseUser != null && currentFirebaseUser.uid == uid) {
                 runCatching {
-                    val databaseId = applicationContext.getString(R.string.firestore_database_id)
+                    val databaseId = com.example.data.RuntimeCloudBootstrapStore.resolveDatabaseId(applicationContext)
                     val db = FirebaseFirestore.getInstance(databaseId)
                     val repo = FirestoreRepository(db, Firebase.auth)
 

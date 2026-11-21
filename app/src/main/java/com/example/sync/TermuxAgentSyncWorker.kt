@@ -58,7 +58,7 @@ class TermuxAgentSyncWorker(
             // Keep Firestore's termux_antigravity node in sync when signed into the matching session
             if (currentFirebaseUser != null && currentFirebaseUser.uid == uid) {
                 runCatching {
-                    val databaseId = applicationContext.getString(R.string.firestore_database_id)
+                    val databaseId = com.example.data.RuntimeCloudBootstrapStore.resolveDatabaseId(applicationContext)
                     val db = FirebaseFirestore.getInstance(databaseId)
                     val repo = FirestoreRepository(db, Firebase.auth)
                     val nodeStatus = when (termuxStatus.health) {

@@ -261,7 +261,7 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.secondary
                         )
                         Text(
-                            text = "すべての API キーと PAT は、Firebase UID ごとに生成された Android Keystore 鍵で AES-256-GCM 暗号化され、端末内のみに保存されます。",
+                            text = "Cloudflare Worker (Google SSO ブローカー) が有効な場合、GitHub PAT や Cloudflare API Token は端末未入力のままでも Google ログインだけで各ワークフローを実行できます。ローカル上書きトークンを保存する場合は Android Keystore 鍵で AES-256-GCM 暗号化されます。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -329,7 +329,7 @@ fun SettingsScreen(
                     )
                     OutlinedButton(
                         onClick = { onVerifyGitHub(githubPat) },
-                        enabled = !isBusy && githubPat.isNotBlank(),
+                        enabled = !isBusy && (githubPat.isNotBlank() || gc2223Endpoint.isNotBlank()),
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(48.dp)
@@ -337,7 +337,7 @@ fun SettingsScreen(
                     ) {
                         Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("GitHub PAT 疎通確認")
+                        Text("GitHub 疎通確認 (PAT / SSO)")
                     }
                 }
 
@@ -385,13 +385,13 @@ fun SettingsScreen(
                     ) {
                         OutlinedButton(
                             onClick = { onVerifyCloudflare(cloudflareApiToken) },
-                            enabled = !isBusy && cloudflareApiToken.isNotBlank(),
+                            enabled = !isBusy && (cloudflareApiToken.isNotBlank() || gc2223Endpoint.isNotBlank()),
                             modifier = Modifier
                                 .weight(1f)
                                 .height(48.dp)
                                 .testTag("settings_verify_cloudflare_button")
                         ) {
-                            Text("CF Token確認")
+                            Text("CF 確認 (Token / SSO)")
                         }
                         OutlinedButton(
                             onClick = { onVerifyGc2223(gc2223Endpoint, gc2223BearerToken) },

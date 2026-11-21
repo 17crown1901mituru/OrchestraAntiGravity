@@ -23,6 +23,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.ConnectException
 import java.net.SocketTimeoutException
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class BridgeCallResult(
@@ -50,6 +51,48 @@ class CloudBridgeClient(
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private fun Request.Builder.applyGatewayAuth(bearerToken: String, firebaseIdToken: String?): Request.Builder {
+        if (bearerToken.isNotBlank()) {
+            header("Authorization", "Bearer ${bearerToken.trim()}")
+        }
+        if (!firebaseIdToken.isNullOrBlank()) {
+            header("X-Firebase-Token", firebaseIdToken.trim())
+        }
+        return this
+    }
+
+    suspend fun fetchClientBootstrapConfig(gatewayUrl: String): Result<RuntimeCloudBootstrapConfig> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val cleanBase = normalizeBaseUrl(gatewayUrl)
+                val req = Request.Builder()
+                    .url("$cleanBase/v1/client-config")
+                    .get()
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException("Gateway /v1/client-config HTTP ${resp.code}: ${raw.take(200)}")
+                    }
+                    val json = JSONObject(raw)
+                    val cfg = RuntimeCloudBootstrapConfig(
+                        gatewayUrl = json.optString("gatewayUrl", cleanBase).ifBlank { cleanBase }.trimEnd('/'),
+                        firebaseProjectId = json.optString("firebaseProjectId", "").trim(),
+                        firebaseAppId = json.optString("firebaseAppId", "").trim(),
+                        firebaseApiKey = json.optString("firebaseApiKey", "").trim(),
+                        firebaseWebClientId = json.optString("firebaseWebClientId", "").trim(),
+                        firestoreDatabaseId = json.optString("firestoreDatabaseId", "(default)").trim().ifBlank { "(default)" },
+                        storageBucket = json.optString("storageBucket", "").trim(),
+                        defaultGithubRepo = json.optString("defaultGithubRepo", "").trim()
+                    )
+                    require(cfg.hasFirebaseRuntimeParams()) {
+                        "Gateway から FIREBASE_PROJECT_ID / FIREBASE_APP_ID / FIREBASE_API_KEY が返却されませんでした"
+                    }
+                    cfg
+                }
+            }
+        }
 
     suspend fun pingGc2223Gateway(
         baseUrl: String,
@@ -247,13 +290,67 @@ class CloudBridgeClient(
         ownerRepo: String,
         workflowFile: String,
         ref: String = "main",
-        inputs: Map<String, String> = mapOf("triggered_by" to "antigravity-android")
+        inputs: Map<String, String> = mapOf("triggered_by" to "antigravity-android"),
+        gatewayUrl: String = "",
+        bearerToken: String = "",
+        firebaseIdToken: String? = null
     ): BridgeCallResult = withContext(Dispatchers.IO) {
-        if (pat.isBlank() || !ownerRepo.contains("/")) {
-            return@withContext BridgeCallResult(false, 0, "Set GitHub PAT and owner/repo (e.g. user/repo) first.")
-        }
         val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
         val cleanWorkflow = workflowFile.trim().ifBlank { "antigravity-deploy.yml" }
+        val canUseGatewaySso = pat.isBlank() &&
+            gatewayUrl.isNotBlank() &&
+            (!firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank())
+
+        if (canUseGatewaySso) {
+            val cleanBase = normalizeBaseUrl(gatewayUrl)
+            return@withContext try {
+                val inputsJson = JSONObject()
+                inputs.forEach { (k, v) -> inputsJson.put(k, v) }
+                val bodyJson = JSONObject().apply {
+                    if (cleanRepo.contains("/")) put("repo", cleanRepo)
+                    put("workflow", cleanWorkflow)
+                    put("ref", ref)
+                    put("inputs", inputsJson)
+                }.toString()
+                val req = Request.Builder()
+                    .url("$cleanBase/v1/dispatch-github")
+                    .applyGatewayAuth(bearerToken, firebaseIdToken)
+                    .post(bodyJson.toRequestBody(jsonMediaType))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    val json = runCatching { JSONObject(raw) }.getOrNull()
+                    val dispatched = json?.optBoolean("dispatched", resp.isSuccessful) ?: resp.isSuccessful
+                    val ghStatus = json?.optInt("status", resp.code) ?: resp.code
+                    val detail = json?.optString("error").orEmpty()
+                        .ifBlank { json?.optString("detail").orEmpty() }
+                        .ifBlank { raw.take(220) }
+                    if (resp.isSuccessful && dispatched) {
+                        BridgeCallResult(
+                            true,
+                            resp.code,
+                            "Google SSO 経由で $cleanWorkflow を起動しました (${cleanRepo.ifBlank { "default repo" }})"
+                        )
+                    } else {
+                        BridgeCallResult(
+                            false,
+                            resp.code,
+                            "SSO Dispatch HTTP ${resp.code} (GitHub $ghStatus): ${detail.ifBlank { resp.message }}"
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                BridgeCallResult(false, 0, e.localizedMessage ?: "SSO workflow dispatch failed")
+            }
+        }
+
+        if (pat.isBlank() || !cleanRepo.contains("/")) {
+            return@withContext BridgeCallResult(
+                false,
+                0,
+                "Google SSO セッション＋Gateway URL、または GitHub PAT と owner/repo を設定してください。"
+            )
+        }
         val url = "$cleanGithubApiBase/repos/$cleanRepo/actions/workflows/$cleanWorkflow/dispatches"
         try {
             val inputsJson = JSONObject()
@@ -289,7 +386,10 @@ class CloudBridgeClient(
         action: TerraformAction,
         targetEnv: String = "dev",
         ref: String = "main",
-        retryCount: Int = 0
+        retryCount: Int = 0,
+        gatewayUrl: String = "",
+        bearerToken: String = "",
+        firebaseIdToken: String? = null
     ): BridgeCallResult = dispatchGitHubWorkflow(
         pat = pat,
         ownerRepo = ownerRepo,
@@ -300,7 +400,10 @@ class CloudBridgeClient(
             "target_env" to targetEnv.ifBlank { "dev" },
             "triggered_by" to "antigravity-android",
             "retry_count" to retryCount.toString()
-        )
+        ),
+        gatewayUrl = gatewayUrl,
+        bearerToken = bearerToken,
+        firebaseIdToken = firebaseIdToken
     )
 
     suspend fun commitFileToGitHub(
@@ -309,15 +412,56 @@ class CloudBridgeClient(
         filePath: String,
         content: String,
         commitMessage: String,
-        branch: String = "main"
+        branch: String = "main",
+        gatewayUrl: String = "",
+        bearerToken: String = "",
+        firebaseIdToken: String? = null
     ): BridgeCallResult = withContext(Dispatchers.IO) {
-        if (pat.isBlank() || !ownerRepo.contains("/")) {
-            return@withContext BridgeCallResult(false, 0, "GitHub PAT と owner/repo をセキュア設定で登録してください。")
-        }
         val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
         val cleanPath = filePath.trim().trimStart('/')
         if (cleanPath.isBlank()) {
             return@withContext BridgeCallResult(false, 0, "ファイルパスが空です。")
+        }
+
+        val canUseGatewaySso = pat.isBlank() &&
+            gatewayUrl.isNotBlank() &&
+            (!firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank())
+
+        if (canUseGatewaySso) {
+            val cleanBase = normalizeBaseUrl(gatewayUrl)
+            return@withContext try {
+                val payload = JSONObject().apply {
+                    if (cleanRepo.contains("/")) put("repo", cleanRepo)
+                    put("path", cleanPath)
+                    put("content", content)
+                    put("message", commitMessage)
+                    put("branch", branch)
+                }.toString()
+                val req = Request.Builder()
+                    .url("$cleanBase/v1/github/commit-file")
+                    .applyGatewayAuth(bearerToken, firebaseIdToken)
+                    .post(payload.toRequestBody(jsonMediaType))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    val json = runCatching { JSONObject(raw) }.getOrNull()
+                    val ok = resp.isSuccessful && (json?.optBoolean("ok", true) == true)
+                    val sha = json?.optString("commitSha").orEmpty().take(7)
+                    val msg = if (ok) {
+                        "GitHub SSO Push 完了: $cleanPath ($branch ${if (sha.isNotBlank()) sha else ""})".trim()
+                    } else {
+                        val err = json?.optString("error").orEmpty().ifBlank { raw.take(220) }
+                        "GitHub SSO Push HTTP ${resp.code}: $err"
+                    }
+                    BridgeCallResult(ok, resp.code, msg)
+                }
+            } catch (e: Exception) {
+                BridgeCallResult(false, 0, e.localizedMessage ?: "GitHub SSO file commit failed")
+            }
+        }
+
+        if (pat.isBlank() || !cleanRepo.contains("/")) {
+            return@withContext BridgeCallResult(false, 0, "Google SSO＋Gateway、または GitHub PAT と owner/repo を設定してください。")
         }
         val url = "$cleanGithubApiBase/repos/$cleanRepo/contents/$cleanPath"
         try {
@@ -377,12 +521,50 @@ class CloudBridgeClient(
     suspend fun rerunFailedGitHubWorkflow(
         pat: String,
         ownerRepo: String,
-        runId: Long
+        runId: Long,
+        gatewayUrl: String = "",
+        bearerToken: String = "",
+        firebaseIdToken: String? = null
     ): BridgeCallResult = withContext(Dispatchers.IO) {
-        if (pat.isBlank() || !ownerRepo.contains("/") || runId <= 0L) {
-            return@withContext BridgeCallResult(false, 0, "有効な Run ID・GitHub PAT・owner/repo が必要です。")
+        if (runId <= 0L) {
+            return@withContext BridgeCallResult(false, 0, "有効な Run ID が必要です。")
         }
         val cleanRepo = ownerRepo.trim().removePrefix("https://github.com/").trim('/')
+        val canUseGatewaySso = pat.isBlank() &&
+            gatewayUrl.isNotBlank() &&
+            (!firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank())
+
+        if (canUseGatewaySso) {
+            val cleanBase = normalizeBaseUrl(gatewayUrl)
+            return@withContext try {
+                val payload = JSONObject().apply {
+                    if (cleanRepo.contains("/")) put("repo", cleanRepo)
+                    put("runId", runId)
+                }.toString()
+                val req = Request.Builder()
+                    .url("$cleanBase/v1/github/rerun")
+                    .applyGatewayAuth(bearerToken, firebaseIdToken)
+                    .post(payload.toRequestBody(jsonMediaType))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    val json = runCatching { JSONObject(raw) }.getOrNull()
+                    val ok = resp.isSuccessful && (json?.optBoolean("ok", true) == true)
+                    if (ok) {
+                        BridgeCallResult(true, resp.code, "Google SSO 経由で失敗ジョブ (Run #$runId) を再実行しました")
+                    } else {
+                        val err = json?.optString("error").orEmpty().ifBlank { raw.take(200) }
+                        BridgeCallResult(false, resp.code, "SSO 再実行 HTTP ${resp.code}: $err")
+                    }
+                }
+            } catch (e: Exception) {
+                BridgeCallResult(false, 0, e.localizedMessage ?: "SSO workflow rerun failed")
+            }
+        }
+
+        if (pat.isBlank() || !cleanRepo.contains("/")) {
+            return@withContext BridgeCallResult(false, 0, "有効な Run ID・GitHub PAT・owner/repo（または SSO Gateway）が必要です。")
+        }
         val rerunFailedUrl = "$cleanGithubApiBase/repos/$cleanRepo/actions/runs/$runId/rerun-failed-jobs"
         try {
             val req = Request.Builder()
@@ -588,12 +770,115 @@ class CloudBridgeClient(
     suspend fun fetchGitHubSyncStatus(
         pat: String,
         ownerRepo: String,
-        workflowFile: String
-    ): GitHubSyncStatus = gitHubActivityService.fetchRepositoryActivitySummary(
-        pat = pat,
-        ownerRepo = ownerRepo,
-        workflowFile = workflowFile
-    )
+        workflowFile: String,
+        gatewayUrl: String = "",
+        bearerToken: String = "",
+        firebaseIdToken: String? = null
+    ): GitHubSyncStatus = withContext(Dispatchers.IO) {
+        if (pat.isNotBlank()) {
+            return@withContext gitHubActivityService.fetchRepositoryActivitySummary(
+                pat = pat,
+                ownerRepo = ownerRepo,
+                workflowFile = workflowFile
+            )
+        }
+        val hasGatewayAuth = gatewayUrl.isNotBlank() &&
+            (!firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank())
+        if (!hasGatewayAuth) {
+            return@withContext gitHubActivityService.fetchRepositoryActivitySummary(
+                pat = pat,
+                ownerRepo = ownerRepo,
+                workflowFile = workflowFile
+            )
+        }
+
+        val cleanGateway = normalizeBaseUrl(gatewayUrl)
+        val encodedRepo = URLEncoder.encode(ownerRepo.trim(), "UTF-8")
+        val encodedWf = URLEncoder.encode(workflowFile.trim(), "UTF-8")
+        val url = "$cleanGateway/v1/sso/status?repo=$encodedRepo&workflow=$encodedWf"
+        try {
+            val req = Request.Builder()
+                .url(url)
+                .applyGatewayAuth(bearerToken, firebaseIdToken)
+                .get()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                if (!resp.isSuccessful || json == null) {
+                    return@withContext GitHubSyncStatus(
+                        health = if (resp.code == 404) SyncHealthState.PARTIAL else SyncHealthState.ERROR,
+                        targetRepo = ownerRepo,
+                        summaryMessage = if (resp.code == 404) {
+                            "Gateway が /v1/sso/status 未対応です（Worker を更新すると Google SSO 経由で GitHub を取得します）"
+                        } else {
+                            "SSO GitHub 同期 HTTP ${resp.code}: ${raw.take(160).ifBlank { resp.message }}"
+                        }
+                    )
+                }
+                val gh = json.optJSONObject("github") ?: return@withContext GitHubSyncStatus(
+                    health = SyncHealthState.MISSING_CREDENTIALS,
+                    targetRepo = ownerRepo,
+                    summaryMessage = "Gateway 側に GITHUB_PAT が未設定です"
+                )
+                val configured = gh.optBoolean("configured", false)
+                val commitsArr = gh.optJSONArray("recentCommits") ?: JSONArray()
+                val commits = (0 until commitsArr.length()).mapNotNull { idx ->
+                    val c = commitsArr.optJSONObject(idx) ?: return@mapNotNull null
+                    com.example.model.GitHubCommitSummary(
+                        sha = c.optString("sha", ""),
+                        message = c.optString("message", ""),
+                        author = c.optString("author", ""),
+                        committedAt = c.optString("committedAt", "")
+                    )
+                }
+                val eventsArr = gh.optJSONArray("recentEvents") ?: JSONArray()
+                val events = (0 until eventsArr.length()).mapNotNull { idx ->
+                    val ev = eventsArr.optJSONObject(idx) ?: return@mapNotNull null
+                    com.example.model.GitHubActivityEvent(
+                        type = ev.optString("type", ""),
+                        actor = ev.optString("actor", ""),
+                        detail = ev.optString("detail", ""),
+                        createdAt = ev.optString("createdAt", "")
+                    )
+                }
+                val errMsg = gh.optString("error", "")
+                val health = when {
+                    !configured -> SyncHealthState.MISSING_CREDENTIALS
+                    errMsg.isNotBlank() -> SyncHealthState.PARTIAL
+                    else -> SyncHealthState.CONNECTED
+                }
+                GitHubSyncStatus(
+                    health = health,
+                    accountLogin = gh.optString("accountLogin", ""),
+                    targetRepo = gh.optString("targetRepo", ownerRepo).ifBlank { ownerRepo },
+                    defaultBranch = gh.optString("defaultBranch", "main"),
+                    isPrivate = gh.optBoolean("isPrivate", false),
+                    openIssuesCount = gh.optInt("openIssuesCount", 0),
+                    openPullRequestsCount = gh.optInt("openPullRequestsCount", 0),
+                    starsCount = gh.optInt("starsCount", 0),
+                    pushedAt = gh.optString("pushedAt", ""),
+                    workflowName = gh.optString("workflowName", workflowFile),
+                    workflowStatus = gh.optString("workflowStatus", ""),
+                    workflowConclusion = gh.optString("workflowConclusion", ""),
+                    workflowUpdatedAt = gh.optString("workflowUpdatedAt", ""),
+                    workflowRunId = gh.optLong("workflowRunId", 0L),
+                    workflowRunUrl = gh.optString("workflowRunUrl", ""),
+                    recentCommits = commits,
+                    recentEvents = events,
+                    summaryMessage = gh.optString("summaryMessage", "").ifBlank {
+                        if (configured) "Google SSO 経由で GitHub 連携済み" else "Worker 側に GITHUB_PAT を設定してください"
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            GitHubSyncStatus(
+                health = SyncHealthState.ERROR,
+                targetRepo = ownerRepo,
+                summaryMessage = e.localizedMessage ?: "SSO GitHub 同期失敗"
+            )
+        }
+    }
 
     suspend fun fetchCloudflareSyncStatus(
         apiToken: String,
@@ -620,11 +905,65 @@ class CloudBridgeClient(
         val latencyMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
 
         if (cleanToken.isBlank()) {
+            val hasSsoAuth = !firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank()
+            if (hasSsoAuth && cleanGateway.isNotBlank()) {
+                val ssoStatus = runCatching {
+                    val req = Request.Builder()
+                        .url("$cleanGateway/v1/sso/status")
+                        .applyGatewayAuth(bearerToken, firebaseIdToken)
+                        .get()
+                        .build()
+                    client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use null
+                        val json = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull()
+                            ?: return@use null
+                        val cf = json.optJSONObject("cloudflare") ?: return@use null
+                        val workersArr = cf.optJSONArray("workers") ?: JSONArray()
+                        val parsedWorkers = (0 until workersArr.length()).mapNotNull { idx ->
+                            val item = workersArr.optJSONObject(idx) ?: return@mapNotNull null
+                            val id = item.optString("scriptId").ifBlank { item.optString("id") }
+                                .ifBlank { return@mapNotNull null }
+                            CloudflareWorkerSummary(
+                                scriptId = id,
+                                modifiedOn = item.optString("modifiedOn", "")
+                            )
+                        }
+                        val tokenConfigured = cf.optBoolean("tokenConfigured", false)
+                        val ssoEmail = json.optString("userEmail", "")
+                        val cfTokenSt = cf.optString("tokenStatus", if (tokenConfigured) "sso-broker" else "unconfigured")
+                        val cfAccId = cf.optString("accountId", resolvedAccountId)
+                        val cfAccName = cf.optString("accountName", "")
+                        val workerCount = cf.optInt("workerCount", parsedWorkers.size)
+                        val ssoMsg = cf.optString("summaryMessage", "").ifBlank {
+                            if (tokenConfigured) {
+                                "Google SSO 連携済み (${ssoEmail.ifBlank { "Gateway" }}) • ${workerCount} Worker(s)"
+                            } else {
+                                "Gateway SSO OK (${latencyMs}ms) • CLOUDFLARE_API_TOKEN 未設定"
+                            }
+                        }
+                        CloudflareSyncStatus(
+                            health = if (gatewayResult.success && tokenConfigured) SyncHealthState.CONNECTED else SyncHealthState.PARTIAL,
+                            tokenStatus = cfTokenSt,
+                            accountName = cfAccName,
+                            accountId = cfAccId,
+                            workerCount = workerCount,
+                            workers = parsedWorkers.take(10),
+                            gatewayUrl = cleanGateway,
+                            gatewayHttpCode = gatewayResult.statusCode,
+                            gatewayLatencyMs = latencyMs,
+                            gatewayHealthMessage = gatewayResult.message,
+                            summaryMessage = ssoMsg
+                        )
+                    }
+                }.getOrNull()
+                if (ssoStatus != null) return@withContext ssoStatus
+            }
+
             val health = if (gatewayResult.success) SyncHealthState.PARTIAL else SyncHealthState.MISSING_CREDENTIALS
             val msg = if (gatewayResult.success) {
-                "Gateway OK (${latencyMs}ms) • Cloudflare API Token 未入力"
+                "Gateway SSO 疎通 OK (${latencyMs}ms) • ローカルCF Token不要"
             } else {
-                "Cloudflare API Token 未入力 (${gatewayResult.message})"
+                "Cloudflare Gateway 未接続 (${gatewayResult.message})"
             }
             return@withContext CloudflareSyncStatus(
                 health = health,
