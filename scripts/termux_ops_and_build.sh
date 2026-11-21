@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'USAGE'
 Usage: bash scripts/termux_ops_and_build.sh [options]
-  --install-pkgs   Install Termux tools (nodejs-lts, python, openjdk-17, aapt2, gradle, gh, terraform, wrangler, firebase-tools)
+  --install-pkgs   Install Termux tools (nodejs-lts, python, openjdk-21, aapt2, gradle, gh, terraform, wrangler, firebase-tools)
   --reauth         Force interactive browser re-login for GitHub / Google Cloud / Cloudflare / Firebase
   --skip-login     Skip interactive browser login checks
   --skip-sync      Skip pre-run `gh repo sync` and `git pull`
@@ -87,7 +87,7 @@ if [[ "$INSTALL_PKGS" == "true" ]]; then
   if command -v pkg >/dev/null 2>&1; then
     log "Installing Termux packages..."
     pkg update -y
-    pkg install -y nodejs-lts python curl jq git gh openssl-tool openjdk-17 aapt2 gradle tur-repo
+    pkg install -y nodejs-lts python curl jq git gh openssl-tool openjdk-21 aapt2 gradle tur-repo
     pkg install -y terraform
     if ! command -v wrangler >/dev/null 2>&1; then
       npm install -g wrangler
