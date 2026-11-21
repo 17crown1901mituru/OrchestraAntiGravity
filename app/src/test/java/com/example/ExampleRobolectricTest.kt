@@ -35,6 +35,7 @@ import com.example.model.TermuxAgentSyncStatus
 import com.example.model.TermuxPresetCommand
 import com.example.sync.CloudStatusSyncWorker
 import com.example.sync.TermuxAgentSyncWorker
+import com.example.sync.UrgentAlertNotifier
 import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.TextPart
 import kotlinx.coroutines.test.runTest
@@ -657,6 +658,7 @@ class ExampleRobolectricTest {
     val port = ss.localPort
     var capturedPostBody = ""
     var capturedFirebaseHdr = ""
+    var capturedTraceparentHdr = ""
     val serverThread = Thread {
       runCatching {
         ss.soTimeout = 5000
@@ -671,6 +673,9 @@ class ExampleRobolectricTest {
               if (h.startsWith("X-Firebase-Token:", ignoreCase = true)) {
                 capturedFirebaseHdr = h.substringAfter(":").trim()
               }
+              if (h.startsWith("traceparent:", ignoreCase = true)) {
+                capturedTraceparentHdr = h.substringAfter(":").trim()
+              }
               if (h.startsWith("Content-Length:", ignoreCase = true)) {
                 contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
               }
@@ -682,7 +687,7 @@ class ExampleRobolectricTest {
             }
             val respBody = when {
               reqLine.startsWith("POST /v1/orchestrate") ->
-                """{"ok":true,"taskType":"tf_plan","detail":"OK_DISPATCHED_antigravity-terraform.yml"}"""
+                """{"ok":true,"taskType":"tf_plan","confidence":0.95,"reasoning":"Validated by Policy-as-Code","traceparent":"00-11112222333344445555666677778888-1111222233334444-01","detail":"OK_DISPATCHED_antigravity-terraform.yml"}"""
               reqLine.startsWith("GET /v1/termux/next-task") ->
                 """{"ok":true,"hasTask":true,"task":{"preset":"git_pull","workdir":"~/OrchestraAntiGravity"}}"""
               else -> """{"error":"unexpected"}"""
@@ -723,6 +728,9 @@ class ExampleRobolectricTest {
       assertEquals("prod", reqJson.getJSONObject("payload").getString("targetEnv"))
       assertTrue(reqJson.getString("traceId").isNotBlank())
       assertTrue(orchRes.traceId.isNotBlank())
+      assertTrue(Regex("^00-[0-9a-f]{32}-[0-9a-f]{16}-01$").matches(capturedTraceparentHdr))
+      assertEquals(0.95, orchRes.aiConfidence ?: 0.0, 0.01)
+      assertEquals("Validated by Policy-as-Code", orchRes.aiReasoning)
 
       val queueRes = bridge.fetchPendingTermuxQueueTask(
         baseUrl = "http://127.0.0.1:$port",
@@ -736,6 +744,8 @@ class ExampleRobolectricTest {
       assertTrue(tfContent.contains("cloudflare_email_routing_rule"))
       assertTrue(tfContent.contains("cloudflare_workers_kv_namespace"))
       assertTrue(tfContent.contains("google_pubsub_topic"))
+      assertTrue(tfContent.contains("google_iam_workload_identity_pool"))
+      assertTrue(tfContent.contains("google_secret_manager_secret"))
 
       val workerContent = StackTemplates.all.first { it.id == "cf_email_autofix_worker" }.content
       assertTrue(workerContent.contains("localPart === \"tf\""))
@@ -748,11 +758,46 @@ class ExampleRobolectricTest {
       assertTrue(workerContent.contains("In-Reply-To"))
       assertTrue(workerContent.contains("loadCiKnowledge"))
       assertTrue(workerContent.contains("github-authentication-token-expiration"))
+      assertTrue(workerContent.contains("ECO_SLEEP"))
+      assertTrue(workerContent.contains("deferred_green"))
+      assertTrue(workerContent.contains("llama-3.2-1b-instruct"))
+      assertTrue(workerContent.contains("THERMAL_GUARD_"))
+      assertTrue(workerContent.contains("runR2LifecycleMaintenance"))
+      assertTrue(workerContent.contains("prev_hash"))
+      assertTrue(workerContent.contains("entry_hash"))
+      assertTrue(workerContent.contains("burnRate"))
+      assertTrue(workerContent.contains("saif_low_conf_exec"))
+      assertTrue(workerContent.contains("/v1/policy/sync"))
+      assertTrue(workerContent.contains("/v1/secret-rotation-hook"))
+      assertTrue(workerContent.contains("/v1/audit/verify"))
+      assertTrue(workerContent.contains("/v1/chaos/drill"))
+      assertTrue(workerContent.contains("<untrusted_data"))
+      assertTrue(workerContent.contains("tainted_external_exec"))
+      assertTrue(workerContent.contains("redactSensitiveText"))
+      assertTrue(workerContent.contains("/v1/nodes/register"))
+      assertTrue(workerContent.contains("/v1/policy/auto-tune"))
+      assertTrue(workerContent.contains("dr-snapshots/"))
+      assertTrue(workerContent.contains("AES-GCM"))
+      assertTrue(workerContent.contains("caches.default"))
+      assertTrue(workerContent.contains("DAILY_NEURON_LIMIT"))
+      assertTrue(workerContent.contains("DEADMAN_PING_URL"))
+      assertTrue(workerContent.contains("sendFcmFallback"))
+      assertTrue(workerContent.contains("GOLDEN_EVAL_CASES"))
+      assertTrue(workerContent.contains("PBKDF2"))
 
       val termuxContent = StackTemplates.all.first { it.id == "termux_antigravity_cli" }.content
       assertTrue(termuxContent.contains("X-Device-Battery"))
+      assertTrue(termuxContent.contains("X-Device-Temp"))
+      assertTrue(termuxContent.contains("recommendedPollSec"))
+      assertTrue(termuxContent.contains("register-node"))
+      assertTrue(termuxContent.contains("X-Node-Capabilities"))
 
-      assertTrue(StackTemplates.all.any { it.id == "github_actions_orchestrator" })
+      val orchWorkflow = StackTemplates.all.first { it.id == "github_actions_orchestrator" }.content
+      assertTrue(orchWorkflow.contains("wrangler versions upload"))
+      assertTrue(StackTemplates.all.any { it.id == "governance_policy_json" })
+      val drScript = StackTemplates.all.first { it.id == "dr_bootstrap_script" }.content
+      assertTrue(drScript.contains("--local"))
+      assertTrue(drScript.contains("pbkdf2_hmac"))
     } finally {
       runCatching { ss.close() }
       runCatching { serverThread.join(1000) }
@@ -767,7 +812,7 @@ class ExampleRobolectricTest {
     val serverThread = Thread {
       runCatching {
         ss.soTimeout = 5000
-        repeat(5) {
+        repeat(14) {
           val sock = runCatching { ss.accept() }.getOrNull() ?: return@repeat
           sock.use { s ->
             val reader = s.getInputStream().bufferedReader()
@@ -787,15 +832,33 @@ class ExampleRobolectricTest {
             }
             val respBody = when {
               reqLine.startsWith("GET /v1/orchestrate/state") ->
-                """{"ok":true,"safeMode":false,"safeReason":"","aiHour":4,"ghHour":2,"dlqCount":1,"approvalsCount":1,"heartbeat":{"battery":82,"charging":true,"network":"wifi","seenAt":"2026-11-20T06:00:00Z"},"cron":{"at":"2026-11-20T06:00:00Z","conclusion":"success","patExpiry":""}}"""
+                """{"ok":true,"safeMode":false,"safeReason":"","aiHour":4,"ghHour":2,"dlqCount":1,"approvalsCount":1,"heartbeat":{"battery":82,"tempC":31.5,"charging":true,"network":"wifi","seenAt":"2026-11-20T06:00:00Z"},"cron":{"at":"2026-11-20T06:00:00Z","conclusion":"success","patExpiry":""},"governance":{"policyVersion":"2026.11.20","saifMinConfidence":0.85,"wifKeylessEnabled":true,"secretLastRotatedAt":"2026-11-20T05:00:00Z"},"sre":{"sliSuccessPct":99.5,"errorBudgetRemainingPct":95.0,"burnRate":0.5,"avgLatencyMs":320,"lastAuditHash":"abcdef123456"},"integrityMatrix":{"gitCommitSha":"1a2b3c4","workerVersion":"v2026.1","terraformRevision":"rev-12","termuxCliVersion":"1.5.0","driftDetected":false},"auditVerification":{"status":"VERIFIED","checkedCount":12},"chaos":{"scorePct":100,"drilledAt":"2026-11-20T04:00:00Z"},"security":{"dlpRedactionsCount":4,"taintBlocksCount":2},"federation":{"preferredNodeId":"home-mini-pc","nodes":[{"nodeId":"home-mini-pc","nodeType":"linux","capabilities":["docker","heavy_build"],"battery":100,"tempC":34.0,"charging":true,"online":true,"lastSeenAt":"2026-11-20T06:00:00Z"}]},"autoTuning":{"prUrl":"https://github.com/user/repo/pull/42","summary":"Keep policy v2026.11.20","goldenScorePct":100,"blockedByGoldenGate":false},"dr":{"lastSnapshotKey":"dr-snapshots/2026-11-20.enc","lastSnapshotAt":"2026-11-20T03:00:00Z","kdf":"PBKDF2-SHA256"},"freeTierGuard":{"kvWritesToday":42,"kvDailyLimit":1000,"aiNeuronsToday":8400,"aiNeuronDailyLimit":10000,"frugalFallbackActive":true},"deadman":{"configured":true,"lastPingAt":"2026-11-20T06:00:00Z"},"sustainability":{"operatingMode":"GREEN_DEFER","greenDeferredCount":2,"carbonIntensityGco2":260,"lastCfeScore":0.72,"aiSavingsPct":75,"aiCachedCount":2,"aiFrugalCount":1,"aiTotalCount":4,"batteryGuardCount":3,"recommendedPollSec":900,"r2":{"auditCount":14,"termuxLogCount":5,"nextPurgeDays":30},"lastDepAuditNote":"All IaC/Workflow specs fresh"}}"""
               reqLine.startsWith("GET /v1/approvals") ->
-                """{"ok":true,"approvals":[{"approvalId":"appr7788","action":"tf_apply","repo":"user/repo","targetEnv":"prod","summary":"Terraform apply (prod)","traceId":"trc123456","expiresAtMs":1900000000000}]}"""
+                """{"ok":true,"approvals":[{"approvalId":"appr7788","action":"saif_low_conf_exec","repo":"user/repo","targetEnv":"prod","confidence":0.72,"reasoning":"Confidence below 0.85 threshold","summary":"Terraform apply (prod)","traceId":"trc123456","expiresAtMs":1900000000000}]}"""
+              reqLine.startsWith("GET /v1/audit/verify") ->
+                """{"ok":true,"status":"VERIFIED","checkedCount":12}"""
               reqLine.startsWith("GET /v1/audit") ->
-                """{"ok":true,"logs":[{"traceId":"trc123456","source":"email:tf@","taskType":"tf","ok":true,"summary":"Plan dispatched","timestamp":"2026-11-20T05:59:00Z"}]}"""
+                """{"ok":true,"logs":[{"traceId":"trc123456","source":"email:tf@","taskType":"tf","ok":true,"confidence":0.95,"prev_hash":"0000000000000000","entry_hash":"abcdef123456","summary":"Plan dispatched","timestamp":"2026-11-20T05:59:00Z"}]}"""
               reqLine.startsWith("POST /v1/approvals/decide") ->
                 """{"ok":true,"approvalId":"appr7788","approved":true,"detail":"OK_DISPATCHED_antigravity-terraform.yml","traceId":"trc123456"}"""
               reqLine.startsWith("POST /v1/circuit-breaker") ->
                 """{"ok":true,"safeMode":true,"traceId":"trc999"}"""
+              reqLine.startsWith("POST /v1/sustainability/mode") ->
+                """{"ok":true,"operatingMode":"ACTIVE","flushedGreenTasks":2,"traceId":"trc888"}"""
+              reqLine.startsWith("POST /v1/policy/sync") ->
+                """{"ok":true,"policyVersion":"2026.11.20","traceId":"trc777"}"""
+              reqLine.startsWith("POST /v1/chaos/drill") ->
+                """{"ok":true,"scorePct":100,"passedChecks":3,"totalChecks":3}"""
+              reqLine.startsWith("POST /v1/nodes/register") ->
+                """{"ok":true,"activeNodesCount":2}"""
+              reqLine.startsWith("POST /v1/policy/auto-tune") ->
+                """{"ok":true,"proposalSummary":"Lower saif.minConfidence 0.85->0.83","prUrl":"https://github.com/user/repo/pull/43"}"""
+              reqLine.startsWith("POST /v1/dr/snapshot") ->
+                """{"ok":true,"snapshotKey":"dr-snapshots/2026-11-20.enc"}"""
+              reqLine.startsWith("POST /v1/dr/restore") ->
+                """{"ok":true,"restoredKeysCount":5}"""
+              reqLine.startsWith("POST /v1/health/deadman-ping") ->
+                """{"ok":true,"pinged":true}"""
               else -> """{"error":"not found"}"""
             }
             val bytes = respBody.toByteArray(Charsets.UTF_8)
@@ -822,13 +885,57 @@ class ExampleRobolectricTest {
       assertEquals(2, snapshot.ghHourCount)
       assertEquals(1, snapshot.dlqCount)
       assertEquals(82, snapshot.termuxBatteryPct)
+      assertEquals(31.5, snapshot.termuxTempC ?: 0.0, 0.01)
       assertEquals(true, snapshot.termuxCharging)
       assertEquals("wifi", snapshot.termuxNetwork)
       assertEquals("success", snapshot.cronLastConclusion)
+      assertEquals("GREEN_DEFER", snapshot.operatingMode)
+      assertEquals(2, snapshot.greenDeferredCount)
+      assertEquals(260, snapshot.carbonIntensityGco2)
+      assertEquals(75, snapshot.aiSavingsPct)
+      assertEquals(3, snapshot.batteryGuardCount)
+      assertEquals(900, snapshot.recommendedPollSec)
+      assertEquals(14, snapshot.r2AuditCount)
+      assertEquals(5, snapshot.r2TermuxLogCount)
+      assertEquals("2026.11.20", snapshot.policyVersion)
+      assertEquals(0.85, snapshot.saifMinConfidence, 0.01)
+      assertTrue(snapshot.wifKeylessEnabled)
+      assertEquals("2026-11-20T05:00:00Z", snapshot.secretLastRotatedAt)
+      assertEquals(99.5, snapshot.sliSuccessPct, 0.01)
+      assertEquals(95.0, snapshot.errorBudgetRemainingPct, 0.01)
+      assertEquals(0.5, snapshot.burnRate, 0.01)
+      assertEquals(320L, snapshot.avgLatencyMs)
+      assertEquals("abcdef123456", snapshot.lastAuditHash)
+      assertEquals("1a2b3c4", snapshot.gitCommitSha)
+      assertEquals("v2026.1", snapshot.workerVersion)
+      assertEquals("rev-12", snapshot.terraformRevision)
+      assertEquals("1.5.0", snapshot.termuxCliVersion)
+      assertFalse(snapshot.versionDriftDetected)
+      assertEquals("VERIFIED", snapshot.auditChainStatus)
+      assertEquals(12, snapshot.auditVerifiedCount)
+      assertEquals(100, snapshot.lastChaosScorePct)
+      assertEquals(4, snapshot.dlpRedactionsCount)
+      assertEquals(2, snapshot.taintBlocksCount)
+      assertEquals(1, snapshot.federatedNodes.size)
+      assertEquals("home-mini-pc", snapshot.federatedNodes.first().nodeId)
+      assertEquals("https://github.com/user/repo/pull/42", snapshot.lastTuningPrUrl)
+      assertEquals("dr-snapshots/2026-11-20.enc", snapshot.lastDrSnapshotKey)
+      assertEquals(42, snapshot.kvWritesToday)
+      assertEquals(1000, snapshot.kvDailyLimit)
+      assertEquals(8400, snapshot.aiNeuronsToday)
+      assertEquals(10000, snapshot.aiNeuronDailyLimit)
+      assertTrue(snapshot.frugalFallbackActive)
+      assertTrue(snapshot.deadmanConfigured)
+      assertEquals("2026-11-20T06:00:00Z", snapshot.lastDeadmanPingAt)
+      assertEquals(100, snapshot.goldenScorePct)
+      assertFalse(snapshot.autoTuneBlockedByGolden)
+      assertEquals("PBKDF2-SHA256", snapshot.drKdfAlgorithm)
       assertEquals(1, snapshot.approvals.size)
       assertEquals("appr7788", snapshot.approvals.first().approvalId)
+      assertEquals(0.72, snapshot.approvals.first().aiConfidence ?: 0.0, 0.01)
       assertEquals(1, snapshot.recentAuditLogs.size)
       assertEquals("trc123456", snapshot.recentAuditLogs.first().traceId)
+      assertEquals("abcdef123456", snapshot.recentAuditLogs.first().entryHash)
 
       val decideRes = hardeningClient.decideApproval(
         baseUrl = "http://127.0.0.1:$port",
@@ -850,9 +957,76 @@ class ExampleRobolectricTest {
       )
       assertTrue(cbRes.success)
       assertTrue(recordedBodies.any { it.contains("\"safeMode\":true") })
+
+      val modeRes = hardeningClient.setOperatingMode(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok",
+        mode = "ACTIVE"
+      )
+      assertTrue(modeRes.success)
+      assertTrue(modeRes.message.contains("2件"))
+      assertTrue(recordedBodies.any { it.contains("\"mode\":\"ACTIVE\"") })
+
+      val policyRes = hardeningClient.syncGovernancePolicy(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok",
+        policyJsonRaw = StackTemplates.all.first { it.id == "governance_policy_json" }.content
+      )
+      assertTrue(policyRes.success)
+      assertTrue(policyRes.message.contains("2026.11.20"))
+
+      val verifyRes = hardeningClient.verifyAuditChain("http://127.0.0.1:$port", "gw_tok", "fb_tok")
+      assertTrue(verifyRes.success)
+      assertTrue(verifyRes.message.contains("VERIFIED"))
+
+      val chaosRes = hardeningClient.runChaosDrill("http://127.0.0.1:$port", "gw_tok", "fb_tok")
+      assertTrue(chaosRes.success)
+      assertTrue(chaosRes.message.contains("100%"))
+
+      val nodeRes = hardeningClient.registerFederatedNode(
+        baseUrl = "http://127.0.0.1:$port",
+        bearerToken = "gw_tok",
+        firebaseIdToken = "fb_tok",
+        nodeId = "android-termux-primary",
+        nodeType = "termux",
+        capabilities = listOf("termux", "android_sms")
+      )
+      assertTrue(nodeRes.success)
+      assertTrue(nodeRes.message.contains("2台"))
+
+      val tuneRes = hardeningClient.triggerPolicyAutoTune("http://127.0.0.1:$port", "gw_tok", "fb_tok", "user/repo")
+      assertTrue(tuneRes.success)
+      assertTrue(tuneRes.message.contains("pull/43"))
+
+      val snapRes = hardeningClient.createDrSnapshot("http://127.0.0.1:$port", "gw_tok", "fb_tok")
+      assertTrue(snapRes.success)
+      assertTrue(snapRes.message.contains("dr-snapshots/2026-11-20.enc"))
+
+      val restoreRes = hardeningClient.restoreDrSnapshot("http://127.0.0.1:$port", "gw_tok", "fb_tok")
+      assertTrue(restoreRes.success)
+      assertTrue(restoreRes.message.contains("5件"))
+
+      val deadmanRes = hardeningClient.pingDeadmanSwitch("http://127.0.0.1:$port", "gw_tok", "fb_tok")
+      assertTrue(deadmanRes.success)
+      assertTrue(deadmanRes.message.contains("Dead Man"))
     } finally {
       runCatching { ss.close() }
       runCatching { serverThread.join(1000) }
     }
+  }
+
+  @Test
+  fun `urgent alert notifier creates channel and checks permission cleanly`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    UrgentAlertNotifier.ensureChannel(context)
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+    val channel = manager.getNotificationChannel(UrgentAlertNotifier.CHANNEL_ID)
+    assertTrue(channel != null)
+    val hasPerm = UrgentAlertNotifier.hasNotificationPermission(context)
+    // On SDK 36 without explicit grant in Robolectric, hasNotificationPermission safely returns false
+    assertFalse(hasPerm)
+    assertFalse(UrgentAlertNotifier.notifyUrgentAlert(context, "Test", "Body"))
   }
 }

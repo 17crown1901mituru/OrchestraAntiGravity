@@ -394,44 +394,60 @@ case "${'$'}{1:-}" in
     ;;
   pull-task)
     LOCAL_PORT="${'$'}{2:-8787}"
+    NODE_ID="${'$'}{ANTIGRAVITY_NODE_ID:-android-termux-primary}"
+    NODE_CAPS="${'$'}{ANTIGRAVITY_NODE_CAPS:-termux,android_sms}"
     BAT_PCT=100
+    BAT_TEMP=28.0
     CHARGING="true"
     if command -v termux-battery-status >/dev/null 2>&1; then
       BAT_JSON="${'$'}(termux-battery-status 2>/dev/null || echo '{}')"
       BAT_PCT="${'$'}(echo "${'$'}BAT_JSON" | jq -r '.percentage // 100')"
+      BAT_TEMP="${'$'}(echo "${'$'}BAT_JSON" | jq -r '.temperature // 28.0')"
       BAT_ST="${'$'}(echo "${'$'}BAT_JSON" | jq -r '.status // "CHARGING"')"
       [ "${'$'}BAT_ST" = "CHARGING" ] || [ "${'$'}BAT_ST" = "FULL" ] && CHARGING="true" || CHARGING="false"
     fi
-    TASK_JSON="${'$'}(curl -sS -H "Authorization: Bearer ${'$'}TOKEN" -H "X-Device-Battery: ${'$'}BAT_PCT" -H "X-Device-Charging: ${'$'}CHARGING" -H "X-Device-Network: termux" "${'$'}GATEWAY/v1/termux/next-task")"
+    TASK_JSON="${'$'}(curl -sS -H "Authorization: Bearer ${'$'}TOKEN" -H "X-Node-Id: ${'$'}NODE_ID" -H "X-Node-Capabilities: ${'$'}NODE_CAPS" -H "X-Device-Battery: ${'$'}BAT_PCT" -H "X-Device-Temp: ${'$'}BAT_TEMP" -H "X-Device-Charging: ${'$'}CHARGING" -H "X-Device-Network: termux" -H "X-Termux-Version: 1.5.0" "${'$'}GATEWAY/v1/termux/next-task?nodeId=${'$'}NODE_ID")"
+    POLL_SEC="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.recommendedPollSec // 60')"
     HAS_TASK="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.hasTask // false')"
     if [ "${'$'}HAS_TASK" != "true" ]; then
-      echo "No executable Termux task (${'$'}(echo "${'$'}TASK_JSON" | jq -r '.deferredReason // "queue empty"'))."
+      echo "No executable Termux task (${'$'}(echo "${'$'}TASK_JSON" | jq -r '.deferredReason // "queue empty"')). Next adaptive poll: ${'$'}{POLL_SEC}s"
       exit 0
     fi
     PRESET="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.preset')"
     WORKDIR="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.workdir // ""')"
     TRACE_ID="${'$'}(echo "${'$'}TASK_JSON" | jq -r '.task.traceId // ""')"
-    echo "Executing leased preset '${'$'}PRESET' (trace=${'$'}TRACE_ID) via local bridge..."
+    echo "Executing leased preset '${'$'}PRESET' on node '${'$'}NODE_ID' (trace=${'$'}TRACE_ID, temp=${'$'}BAT_TEMP°C) via local bridge..."
     RUN_RES="${'$'}(curl -sS -X POST "http://127.0.0.1:${'$'}{LOCAL_PORT}/run" \
       -H "Content-Type: application/json" \
       ${'$'}{ANTIGRAVITY_LOCAL_TOKEN:+-H "Authorization: Bearer ${'$'}ANTIGRAVITY_LOCAL_TOKEN"} \
       -d "${'$'}(jq -n --arg p "${'$'}PRESET" --arg w "${'$'}WORKDIR" '{preset:${'$'}p,workdir:${'$'}w}')")"
-    ACK_PAYLOAD="${'$'}(echo "${'$'}RUN_RES" | jq --arg tid "${'$'}TRACE_ID" '. + {traceId: ${'$'}tid}')"
+    ACK_PAYLOAD="${'$'}(echo "${'$'}RUN_RES" | jq --arg tid "${'$'}TRACE_ID" --arg nid "${'$'}NODE_ID" '. + {traceId: ${'$'}tid, nodeId: ${'$'}nid}')"
     curl -sS -X POST "${'$'}GATEWAY/v1/termux/ack" \
       -H "Authorization: Bearer ${'$'}TOKEN" \
       -H "Content-Type: application/json" \
       -d "${'$'}ACK_PAYLOAD" >/dev/null
-    echo "${'$'}ACK_PAYLOAD" | jq .
+    echo "${'$'}ACK_PAYLOAD" | jq --argjson poll "${'$'}POLL_SEC" '. + {recommendedPollSec: ${'$'}poll}'
+    ;;
+  register-node)
+    NODE_ID="${'$'}{2:-${'$'}{ANTIGRAVITY_NODE_ID:-android-termux-primary}}"
+    NODE_TYPE="${'$'}{3:-termux}"
+    CAPS_CSV="${'$'}{4:-${'$'}{ANTIGRAVITY_NODE_CAPS:-termux,android_sms}}"
+    CAPS_JSON="${'$'}(echo "${'$'}CAPS_CSV" | jq -Rc 'split(",")')"
+    curl -sS -X POST "${'$'}GATEWAY/v1/nodes/register" \
+      -H "Authorization: Bearer ${'$'}TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "${'$'}(jq -n --arg id "${'$'}NODE_ID" --arg t "${'$'}NODE_TYPE" --argjson c "${'$'}CAPS_JSON" '{nodeId:${'$'}id,nodeType:${'$'}t,capabilities:${'$'}c}')" | jq .
     ;;
   "")
-    echo "AntiGravityAgent CLI v1.4"
-    echo "  antigravity serve [port]            # Start /status + whitelisted /run bridge (default 8787)"
+    echo "AntiGravityAgent CLI v1.5"
+    echo "  antigravity serve [port]                      # Start /status + whitelisted /run bridge (default 8787)"
     echo "  antigravity health"
     echo "  antigravity dispatch owner/repo [workflow.yml]"
-    echo "  antigravity tf <plan|apply> [env]   # Run local or print remote Terraform dispatch"
-    echo "  antigravity heal <logfile> [repo]   # Send error log to Email Self-Heal Worker"
-    echo "  antigravity crawl <url>             # Summarize URL/domain solution via Gateway"
-    echo "  antigravity pull-task [local_port]  # Pull & run Email-queued safe task on Termux"
+    echo "  antigravity tf <plan|apply> [env]             # Run local or print remote Terraform dispatch"
+    echo "  antigravity heal <logfile> [repo]             # Send error log to Email Self-Heal Worker"
+    echo "  antigravity crawl <url>                       # Summarize URL/domain solution via Gateway"
+    echo "  antigravity pull-task [local_port]            # Pull & run Email-queued safe task on federated node"
+    echo "  antigravity register-node [id] [type] [caps]  # Register federated node (e.g. home-pc docker heavy_build)"
     echo "  antigravity <natural language prompt>"
     ;;
   *)

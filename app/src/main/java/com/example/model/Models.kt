@@ -352,7 +352,10 @@ data class OrchestrationRunResult(
     val statusCode: Int,
     val summary: String,
     val detail: String = "",
-    val traceId: String = ""
+    val traceId: String = "",
+    val traceparent: String = "",
+    val aiConfidence: Double? = null,
+    val aiReasoning: String = ""
 )
 
 data class PendingApprovalItem(
@@ -362,7 +365,9 @@ data class PendingApprovalItem(
     val targetEnv: String = "dev",
     val summary: String = "",
     val traceId: String = "",
-    val expiresAtMs: Long = 0L
+    val expiresAtMs: Long = 0L,
+    val aiConfidence: Double? = null,
+    val aiReasoning: String = ""
 )
 
 data class AuditTraceEntry(
@@ -371,7 +376,23 @@ data class AuditTraceEntry(
     val taskType: String,
     val ok: Boolean,
     val summary: String,
-    val timestamp: String
+    val timestamp: String,
+    val traceparent: String = "",
+    val prevHash: String = "",
+    val entryHash: String = "",
+    val aiConfidence: Double? = null,
+    val aiReasoning: String = ""
+)
+
+data class FederationNodeItem(
+    val nodeId: String,
+    val nodeType: String = "termux",
+    val capabilities: List<String> = emptyList(),
+    val batteryPct: Int? = null,
+    val tempC: Double? = null,
+    val charging: Boolean? = null,
+    val online: Boolean = true,
+    val lastSeenAt: String = ""
 )
 
 data class OrchestrationHardeningState(
@@ -388,6 +409,57 @@ data class OrchestrationHardeningState(
     val cronLastAt: String = "",
     val cronLastConclusion: String = "",
     val patExpiryWarning: String = "",
+    val operatingMode: String = "ACTIVE",
+    val greenDeferredCount: Int = 0,
+    val carbonIntensityGco2: Int = 0,
+    val lastCfeScore: Double = 0.72,
+    val aiSavingsPct: Int = 0,
+    val aiCachedCount: Int = 0,
+    val aiFrugalCount: Int = 0,
+    val aiTotalCount: Int = 0,
+    val termuxTempC: Double? = null,
+    val batteryGuardCount: Int = 0,
+    val recommendedPollSec: Int = 60,
+    val r2AuditCount: Int = 0,
+    val r2TermuxLogCount: Int = 0,
+    val r2NextPurgeDays: Int = 30,
+    val lastDepAuditNote: String = "",
+    val policyVersion: String = "2026.11.20",
+    val saifMinConfidence: Double = 0.85,
+    val wifKeylessEnabled: Boolean = true,
+    val secretLastRotatedAt: String = "",
+    val sliSuccessPct: Double = 100.0,
+    val errorBudgetRemainingPct: Double = 100.0,
+    val burnRate: Double = 0.0,
+    val avgLatencyMs: Long = 0L,
+    val lastAuditHash: String = "",
+    val gitCommitSha: String = "-",
+    val workerVersion: String = "-",
+    val terraformRevision: String = "-",
+    val termuxCliVersion: String = "1.5.0",
+    val versionDriftDetected: Boolean = false,
+    val auditChainStatus: String = "UNVERIFIED",
+    val auditVerifiedCount: Int = 0,
+    val lastChaosScorePct: Int? = null,
+    val lastChaosDrilledAt: String = "",
+    val dlpRedactionsCount: Int = 0,
+    val taintBlocksCount: Int = 0,
+    val federatedNodes: List<FederationNodeItem> = emptyList(),
+    val preferredNodeId: String = "default-termux",
+    val lastTuningPrUrl: String = "",
+    val lastTuningSummary: String = "",
+    val lastDrSnapshotKey: String = "",
+    val lastDrSnapshotAt: String = "",
+    val kvWritesToday: Int = 0,
+    val kvDailyLimit: Int = 1000,
+    val aiNeuronsToday: Int = 0,
+    val aiNeuronDailyLimit: Int = 10000,
+    val frugalFallbackActive: Boolean = false,
+    val deadmanConfigured: Boolean = false,
+    val lastDeadmanPingAt: String = "",
+    val goldenScorePct: Int = 100,
+    val autoTuneBlockedByGolden: Boolean = false,
+    val drKdfAlgorithm: String = "PBKDF2-SHA256",
     val approvals: List<PendingApprovalItem> = emptyList(),
     val recentAuditLogs: List<AuditTraceEntry> = emptyList(),
     val statusMessage: String = ""

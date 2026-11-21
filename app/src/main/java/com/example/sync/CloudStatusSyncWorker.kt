@@ -9,6 +9,7 @@ import com.example.R
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
+import com.example.data.OrchestrationHardeningClient
 import com.example.data.SyncSnapshotStore
 import com.example.model.SyncHealthState
 import com.google.firebase.Firebase
@@ -122,6 +123,33 @@ class CloudStatusSyncWorker(
                 }.onFailure { err ->
                     Log.w(TAG, "Optional Firestore node status sync skipped", err)
                 }
+            }
+
+            // Best-effort check for SAFE_MODE / gateway errors to trigger local emergency notification
+            val hardening = if (credentials.gc2223Endpoint.isNotBlank()) {
+                runCatching {
+                    OrchestrationHardeningClient().fetchHardeningSnapshot(
+                        baseUrl = credentials.gc2223Endpoint,
+                        bearerToken = credentials.gc2223BearerToken,
+                        firebaseIdToken = idToken
+                    )
+                }.getOrNull()
+            } else null
+
+            if (hardening?.safeMode == true) {
+                UrgentAlertNotifier.notifyUrgentAlert(
+                    context = applicationContext,
+                    title = "AntiGravity SAFE_MODE 作動中",
+                    body = hardening.safeReason.ifBlank { "サーキットブレーカーにより自律タスクが一時停止されました。" },
+                    notificationId = 9001
+                )
+            } else if (cloudflareStatus.health == SyncHealthState.ERROR) {
+                UrgentAlertNotifier.notifyUrgentAlert(
+                    context = applicationContext,
+                    title = "AntiGravity Gateway 障害検知",
+                    body = cloudflareStatus.summaryMessage.ifBlank { "gc2223.com ゲートウェイへの疎通に失敗しました。" },
+                    notificationId = 9002
+                )
             }
 
             Result.success(

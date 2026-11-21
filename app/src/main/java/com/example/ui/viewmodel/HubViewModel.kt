@@ -6,6 +6,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.BridgeCallResult
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
@@ -469,10 +470,12 @@ class HubViewModel(
                 val creds = _credentials.value
                 val targets = listOf(
                     "terraform_llm_infra" to "infra/main.tf",
+                    "governance_policy_json" to "governance-policy.json",
                     "cf_email_autofix_worker" to "worker/src/worker.js",
                     "wrangler_email_selfheal" to "worker/wrangler.toml",
                     "github_actions_terraform" to ".github/workflows/antigravity-terraform.yml",
-                    "github_actions_orchestrator" to ".github/workflows/antigravity-orchestrator.yml"
+                    "github_actions_orchestrator" to ".github/workflows/antigravity-orchestrator.yml",
+                    "dr_bootstrap_script" to "scripts/bootstrap-dr.sh"
                 )
                 var successCount = 0
                 var lastErr = ""
@@ -610,6 +613,138 @@ class HubViewModel(
                     enableSafeMode = enable,
                     reason = reason
                 )
+                _statusBanner.value = res.message
+                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun setSustainabilityMode(mode: String) {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val res = hardeningClient.setOperatingMode(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken,
+                    mode = mode
+                )
+                _statusBanner.value = res.message
+                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun syncGovernancePolicy() {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val policyTpl = StackTemplates.all.firstOrNull { it.id == "governance_policy_json" }?.content
+                    ?: "{}"
+                val res = hardeningClient.syncGovernancePolicy(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken,
+                    policyJsonRaw = policyTpl
+                )
+                _statusBanner.value = res.message
+                _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
+                    baseUrl = creds.gc2223Endpoint,
+                    bearerToken = creds.gc2223BearerToken,
+                    firebaseIdToken = idToken
+                )
+            } finally {
+                _isHardeningBusy.value = false
+            }
+        }
+    }
+
+    fun verifyAuditChain() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.verifyAuditChain(creds.gc2223Endpoint, creds.gc2223BearerToken, idToken)
+        }
+    }
+
+    fun runChaosDrill() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.runChaosDrill(creds.gc2223Endpoint, creds.gc2223BearerToken, idToken)
+        }
+    }
+
+    fun registerLocalNode(
+        nodeId: String = "android-termux-primary",
+        nodeType: String = "termux",
+        capabilities: List<String> = listOf("termux", "android_sms")
+    ) {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.registerFederatedNode(
+                baseUrl = creds.gc2223Endpoint,
+                bearerToken = creds.gc2223BearerToken,
+                firebaseIdToken = idToken,
+                nodeId = nodeId,
+                nodeType = nodeType,
+                capabilities = capabilities
+            )
+        }
+    }
+
+    fun triggerPolicyAutoTune() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.triggerPolicyAutoTune(
+                baseUrl = creds.gc2223Endpoint,
+                bearerToken = creds.gc2223BearerToken,
+                firebaseIdToken = idToken,
+                ownerRepo = creds.githubOwnerRepo
+            )
+        }
+    }
+
+    fun createDrSnapshot() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.createDrSnapshot(creds.gc2223Endpoint, creds.gc2223BearerToken, idToken)
+        }
+    }
+
+    fun restoreLatestDrSnapshot() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.restoreDrSnapshot(creds.gc2223Endpoint, creds.gc2223BearerToken, idToken)
+        }
+    }
+
+    fun pingDeadmanSwitch() {
+        runHardeningAction { creds, idToken ->
+            hardeningClient.pingDeadmanSwitch(creds.gc2223Endpoint, creds.gc2223BearerToken, idToken)
+        }
+    }
+
+    private fun runHardeningAction(
+        block: suspend (ExternalCredentials, String?) -> BridgeCallResult
+    ) {
+        if (_isHardeningBusy.value) return
+        viewModelScope.launch {
+            _isHardeningBusy.value = true
+            try {
+                val creds = _credentials.value
+                val idToken = fetchFirebaseIdToken()
+                val res = block(creds, idToken)
                 _statusBanner.value = res.message
                 _hardeningState.value = hardeningClient.fetchHardeningSnapshot(
                     baseUrl = creds.gc2223Endpoint,

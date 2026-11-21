@@ -34,9 +34,19 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
    - **Email Worker 宛先別ルーティング & 自律ハードニング (`worker/src/worker.js`)**: `ci-heal@`（エラー診断＆再実行）、`tf@`（Terraform `plan`/`apply` 起動）、`crawl@`（URL 調査＆返信）、`task@`（Workers AI によるタスク分類・実行）を統合処理。30分 TTL ワンタイム承認（`APPROVE APPLY: <id>` / `APPROVE RERUN: <id>`）、メールスレッド文脈記憶（`In-Reply-To` / `References`）、CI 修復ナレッジベース、時間別レート制限＆`SAFE_MODE` サーキットブレーカー、6時間毎 Cron CI 監視＋`GITHUB_PAT` 期限アラートを搭載。
    - **`CloudStatusSyncWorker` / `TermuxAgentSyncWorker` / `POST /run` & Pull キュー耐障害機構**: Termux `antigravity pull-task` はバッテリー残量・充電・ネットワーク状態（`X-Device-Battery` / `X-Device-Charging` / `X-Device-Network`）を送信し、10分リース・最大3回リトライ後の DLQ 退避（`dlq:`）・`/v1/termux/ack` 時の R2 ログ退避に対応。
 
-6. **Terraform & 全体オーケストレーション自動化キット (`DeployKitScreen`, `OrchestrationHardeningPanel`, `OrchestrationTemplates`)**
-   - **Terraform IaC (`infra/main.tf`)**: GCP Cloud Run LLM 実行基盤・`$3/月` 予算アラート＋**Pub/Sub 実遮断フック**（`google_pubsub_topic.budget_alerts` -> `/v1/gcp-budget-hook` で `SAFE_MODE` 自動起動）・Cloudflare R2（監査 JSONL / Termux ログ / CI ナレッジ / tfstate）に加え、Cloudflare KV (`orchestration_kv`) と Email Routing ルールを一括管理。
-   - **アプリ側ハードニング・承認・監査パネル (`OrchestrationHardeningPanel`)**: `trace_id` 一貫追跡（App -> Worker -> GitHub Actions -> Termux -> R2 監査タイムライン / Firestore テレメトリ）、ワンタップ承認／却下（`/v1/approvals/decide`）、`SAFE_MODE` 緊急遮断・解除トグル（`/v1/circuit-breaker`）、Termux Heartbeat・DLQ・Cron 監視状況をアプリ内からリアルタイム操作可能。
+6. **Terraform & サステナブル全体オーケストレーション (`DeployKitScreen`, `OrchestrationHardeningPanel`, `SustainabilityTelemetryCard`, `GovernanceControlPlaneCard`, `ResilienceOperationsCard`)**
+   - **Terraform IaC (`infra/main.tf`)**: GCP Cloud Run LLM 実行基盤（`REGION_CFE_SCORE` メタデータ付与）・`$3/月` 予算アラート＋**Pub/Sub 実遮断フック**・**Workload Identity Federation (OIDC キーレス認証)**・**GCP Secret Manager ＋ Pub/Sub ローテーションフック (`/v1/secret-rotation-hook`)**・Cloudflare R2（30日/90日DR/180日ナレッジポリシー出力）と KV / Email Routing ルールを一括管理。
+   - **GreenOps & Frugal AI (`worker/src/worker.js`)**: 炭素強度が高い時間帯の低緊急タスク遅延（`GREEN_DEFER`）、1B 軽量モデル＋SHA-256 セマンティックキャッシュによる推論スキップ、R2 月次ログ圧縮（`audit/monthly/`）、週次依存鮮度チェック、14日間無操作時の自動 `ECO_SLEEP` 移行を搭載。
+   - **Google SRE / SAIF / Policy-as-Code 一元ガバナンス**: 単一マニフェスト `governance-policy.json` を `ORCH_KV` (`/v1/policy/sync`) へ同期しレート制限・Termux 許可コマンド・SAIF 信頼度閾値（`0.85` 未満は承認キュー `saif_low_conf_exec` へ自動保留）を統一制御。W3C OpenTelemetry `traceparent` 横断追跡・SLI/SLO バーンレート監視・SHA-256 監査ハッシュ連鎖・Wrangler Canary 10%→100% 段階的ロールアウト（異常時自動ロールバック）・**System Integrity Matrix** を統合。
+   - **監査鎖検証・カオス自己診断・LLM 境界防御・マルチノード・自己進化 PR・暗号化 DR**:
+     - **能動検証 (`GET /v1/audit/verify`) & カオス GameDay (`POST /v1/chaos/drill`)**: R2 監査ログの SHA-256 連続性検証（`Chain: VERIFIED`）と、月次/手動の無害 Dry-Run 自己診断スコア化。
+     - **LLM セキュリティ境界 & DLP**: `<untrusted_data>` 入力サンドボックス、Taint Tracking（外部データ由来の高権限実行を `tainted_external_exec` 承認キューへ強制隔離）、SSRF URL 検証、R2/KV/メール出力前の機密トークン自動マスキング。
+     - **マルチノード・フェデレーション (`POST /v1/nodes/register`, `antigravity register-node`)**: Termux 端末や Linux/Docker ノードの capability に応じたタスク動的ルーティング。
+     - **自己進化ポリシー PR (`POST /v1/policy/auto-tune`) & Golden Test ゲート**: 週次で承認履歴を解析し、12ケースの回帰テスト（`GOLDEN_EVAL_CASES` 100% 合格＋SAIF 下限 0.80 検証）を通過した場合のみ `governance-policy.json` 更新 Pull Request を自動作成。
+     - **暗号化 DR バックアップ＆ローカル自己完結復元 (`POST /v1/dr/snapshot`, `POST /v1/dr/restore`, `scripts/bootstrap-dr.sh --local`)**: R2 へ **PBKDF2-SHA256**（100,000 回反復＋ランダムソルト）＋ **AES-256-GCM** 暗号化スナップショットを退避し、`DR_PASSPHRASE` 単体でのオフライン復号復旧にも対応。
+     - **無料枠天井ガード (`Free-Tier Guard`)**: `ORCH_KV` の高頻度書き込み（レート制限・Heartbeat・推論キャッシュ等）を **Cloudflare Workers Cache API (`caches.default`)** へ逃がして 1,000 writes/日上限を回避し、Workers AI の 10,000 Neurons/日消費を計測して 80% で軽量モデル（1B）へ自動縮退（倹約AIモード）、95% でルールベースへフェイルオーバー。
+     - **多重外部監視 (`Dead Man's Switch` & FCM / ローカル通知)**: 6時間 Cron / `POST /v1/health/deadman-ping` で外部監視 URL（`DEADMAN_PING_URL`）へ Ping し、緊急アラート・メール送信障害時は FCM フォールバック（`sendFcmFallback`）および Android 側の `UrgentAlertNotifier`（`POST_NOTIFICATIONS`）で端末へ通知。
+   - **アプリ側制御・レジリエンス UI (`SustainabilityTelemetryCard`, `GovernanceControlPlaneCard`, `ResilienceOperationsCard`)**: 無料枠消費ゲージ、監査チェーン検証、カオス自己診断、端末ノード登録、自己進化 PR 生成、暗号化 DR 退避／復元、Dead Man Ping をワンタップで操作可能。
 
 ---
 
@@ -66,8 +76,9 @@ Google アカウント SSO を起点に、**Firebase**（Auth / Firestore / AI L
 │       │   └── Models.kt                    # UI 状態・Firestore エンティティ・同期スナップショットモデル
 │       ├── sync/
 │       │   ├── BackgroundSyncScheduler.kt   # 定期 / 即時 WorkManager スケジューリング・状態 Flow
-│       │   ├── CloudStatusSyncWorker.kt     # GitHub + Cloudflare ステータス取得 CoroutineWorker
-│       │   └── TermuxAgentSyncWorker.kt     # Termux AntiGravityAgent ローカルステータス取得 CoroutineWorker
+│       │   ├── CloudStatusSyncWorker.kt     # GitHub + Cloudflare ステータス取得 & 緊急ローカル通知判定
+│       │   ├── TermuxAgentSyncWorker.kt     # Termux AntiGravityAgent ローカルステータス取得 CoroutineWorker
+│       │   └── UrgentAlertNotifier.kt       # SAFE_MODE / 障害時のローカル高優先度通知チャンネル制御
 │       └── ui/
 │           ├── screens/                     # Auth / MainHub / AgentChat / StatusDashboard / Nodes / CostMonitor / DeployKit / Blueprints / Settings
 │           ├── theme/                       # Material 3 カラー・タイポグラフィ・テーマ定義

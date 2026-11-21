@@ -462,7 +462,10 @@ class CloudBridgeClient(
     ): OrchestrationRunResult = withContext(Dispatchers.IO) {
         val cleanBase = normalizeBaseUrl(baseUrl)
         val url = "$cleanBase/v1/orchestrate"
-        val traceId = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+        val traceHex = java.util.UUID.randomUUID().toString().replace("-", "").lowercase()
+        val spanHex = java.util.UUID.randomUUID().toString().replace("-", "").take(16).lowercase()
+        val traceId = traceHex.take(12)
+        val traceparent = "00-$traceHex-$spanHex-01"
         try {
             val innerPayload = JSONObject().apply {
                 put("prompt", promptOrInput.trim())
@@ -474,6 +477,7 @@ class CloudBridgeClient(
             }
             val payload = JSONObject().apply {
                 put("traceId", traceId)
+                put("traceparent", traceparent)
                 put("taskType", taskType.taskId)
                 put("routeAddress", routeTarget.address)
                 put("repo", ownerRepo.trim())
@@ -482,6 +486,7 @@ class CloudBridgeClient(
 
             val builder = Request.Builder()
                 .url(url)
+                .header("traceparent", traceparent)
                 .post(payload.toRequestBody(jsonMediaType))
             if (bearerToken.isNotBlank()) {
                 builder.header("Authorization", "Bearer ${bearerToken.trim()}")
@@ -495,6 +500,11 @@ class CloudBridgeClient(
                 val json = runCatching { JSONObject(raw) }.getOrNull()
                 val ok = resp.isSuccessful && (json?.optBoolean("ok", true) == true)
                 val returnedTraceId = json?.optString("traceId").orEmpty().ifBlank { traceId }
+                val returnedTraceparent = json?.optString("traceparent").orEmpty().ifBlank { traceparent }
+                val confidence = if (json != null && json.has("confidence") && !json.isNull("confidence")) {
+                    json.optDouble("confidence")
+                } else null
+                val reasoning = json?.optString("reasoning").orEmpty()
                 val detail = json?.optString("detail").orEmpty().ifBlank { raw.take(600) }
                 val summary = if (ok) {
                     "${routeTarget.address} -> ${taskType.label} 実行完了 (HTTP ${resp.code})"
@@ -511,7 +521,10 @@ class CloudBridgeClient(
                     statusCode = resp.code,
                     summary = summary,
                     detail = detail,
-                    traceId = returnedTraceId
+                    traceId = returnedTraceId,
+                    traceparent = returnedTraceparent,
+                    aiConfidence = confidence,
+                    aiReasoning = reasoning
                 )
             }
         } catch (e: Exception) {
@@ -522,7 +535,8 @@ class CloudBridgeClient(
                 statusCode = 0,
                 summary = e.localizedMessage ?: "オーケストレーション接続失敗",
                 detail = e.localizedMessage.orEmpty(),
-                traceId = traceId
+                traceId = traceId,
+                traceparent = traceparent
             )
         }
     }

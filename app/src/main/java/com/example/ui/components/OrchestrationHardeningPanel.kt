@@ -45,7 +45,16 @@ fun OrchestrationHardeningPanel(
     isBusy: Boolean,
     onRefresh: () -> Unit,
     onDecideApproval: (approvalId: String, approve: Boolean) -> Unit,
-    onToggleSafeMode: (enable: Boolean, reason: String) -> Unit
+    onToggleSafeMode: (enable: Boolean, reason: String) -> Unit,
+    onSetOperatingMode: (mode: String) -> Unit = {},
+    onSyncPolicy: () -> Unit = {},
+    onVerifyAuditChain: () -> Unit = {},
+    onRunChaosDrill: () -> Unit = {},
+    onRegisterLocalNode: () -> Unit = {},
+    onTriggerAutoTune: () -> Unit = {},
+    onCreateDrSnapshot: () -> Unit = {},
+    onRestoreDrSnapshot: () -> Unit = {},
+    onPingDeadmanSwitch: () -> Unit = {}
 ) {
     Card(
         colors = CardDefaults.cardColors(
@@ -221,6 +230,30 @@ fun OrchestrationHardeningPanel(
                 }
             }
 
+            SustainabilityTelemetryCard(
+                state = state,
+                isBusy = isBusy,
+                onSetOperatingMode = onSetOperatingMode
+            )
+
+            GovernanceControlPlaneCard(
+                state = state,
+                isBusy = isBusy,
+                onSyncPolicy = onSyncPolicy,
+                onVerifyAuditChain = onVerifyAuditChain,
+                onRunChaosDrill = onRunChaosDrill
+            )
+
+            ResilienceOperationsCard(
+                state = state,
+                isBusy = isBusy,
+                onRegisterLocalNode = onRegisterLocalNode,
+                onTriggerAutoTune = onTriggerAutoTune,
+                onCreateDrSnapshot = onCreateDrSnapshot,
+                onRestoreDrSnapshot = onRestoreDrSnapshot,
+                onPingDeadmanSwitch = onPingDeadmanSwitch
+            )
+
             // 3. Pending One-Time Approvals (30m TTL)
             Text(
                 text = "ワンタイム承認待ち (${state.approvals.size}件 / TTL 30分)",
@@ -250,11 +283,19 @@ fun OrchestrationHardeningPanel(
                                 text = "[${item.approvalId}] ${item.summary.ifBlank { item.action }} (${item.targetEnv})",
                                 style = MaterialTheme.typography.labelLarge
                             )
+                            val confSuffix = item.aiConfidence?.let { " • SAIF ${(it * 100).toInt()}%" } ?: ""
                             Text(
-                                text = "Repo: ${item.repo.ifBlank { "-" }} • trace: ${item.traceId.ifBlank { "-" }}",
+                                text = "Repo: ${item.repo.ifBlank { "-" }} • trace: ${item.traceId.ifBlank { "-" }}$confSuffix",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            if (item.aiReasoning.isNotBlank()) {
+                                Text(
+                                    text = "根拠: ${item.aiReasoning.take(120)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -309,8 +350,10 @@ fun OrchestrationHardeningPanel(
                     )
                 }
                 state.recentAuditLogs.take(5).forEach { log ->
+                    val hashBadge = if (log.entryHash.isNotBlank()) " #${log.entryHash.take(8)}" else ""
+                    val confBadge = log.aiConfidence?.let { " (${(it * 100).toInt()}%)" } ?: ""
                     Text(
-                        text = "• [${log.traceId.ifBlank { "-" }}] ${log.source} (${log.taskType}): ${log.summary.take(90)}",
+                        text = "• [${log.traceId.ifBlank { "-" }}$hashBadge] ${log.source} (${log.taskType}$confBadge): ${log.summary.take(90)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = if (log.ok) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
                         maxLines = 2,

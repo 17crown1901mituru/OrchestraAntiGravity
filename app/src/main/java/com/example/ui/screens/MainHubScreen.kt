@@ -424,6 +424,15 @@ fun MainHubScreen(
                             onRefreshHardening = viewModel::refreshHardeningState,
                             onDecideApproval = viewModel::decideApproval,
                             onToggleSafeMode = viewModel::setCircuitBreakerSafeMode,
+                            onSetOperatingMode = viewModel::setSustainabilityMode,
+                            onSyncPolicy = viewModel::syncGovernancePolicy,
+                            onVerifyAuditChain = viewModel::verifyAuditChain,
+                            onRunChaosDrill = viewModel::runChaosDrill,
+                            onRegisterLocalNode = { viewModel.registerLocalNode() },
+                            onTriggerAutoTune = viewModel::triggerPolicyAutoTune,
+                            onCreateDrSnapshot = viewModel::createDrSnapshot,
+                            onRestoreDrSnapshot = viewModel::restoreLatestDrSnapshot,
+                            onPingDeadmanSwitch = viewModel::pingDeadmanSwitch,
                             onSaveTemplate = { tpl ->
                                 viewModel.saveBlueprint(
                                     title = tpl.title,

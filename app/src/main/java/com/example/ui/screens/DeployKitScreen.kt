@@ -78,6 +78,15 @@ fun DeployKitScreen(
     onRefreshHardening: () -> Unit = {},
     onDecideApproval: (approvalId: String, approve: Boolean) -> Unit = { _, _ -> },
     onToggleSafeMode: (enable: Boolean, reason: String) -> Unit = { _, _ -> },
+    onSetOperatingMode: (mode: String) -> Unit = {},
+    onSyncPolicy: () -> Unit = {},
+    onVerifyAuditChain: () -> Unit = {},
+    onRunChaosDrill: () -> Unit = {},
+    onRegisterLocalNode: () -> Unit = {},
+    onTriggerAutoTune: () -> Unit = {},
+    onCreateDrSnapshot: () -> Unit = {},
+    onRestoreDrSnapshot: () -> Unit = {},
+    onPingDeadmanSwitch: () -> Unit = {},
     onSaveTemplate: (StackTemplate) -> Unit,
     onShowMessage: (String) -> Unit
 ) {
@@ -260,7 +269,16 @@ fun DeployKitScreen(
                             isBusy = isHardeningBusy,
                             onRefresh = onRefreshHardening,
                             onDecideApproval = onDecideApproval,
-                            onToggleSafeMode = onToggleSafeMode
+                            onToggleSafeMode = onToggleSafeMode,
+                            onSetOperatingMode = onSetOperatingMode,
+                            onSyncPolicy = onSyncPolicy,
+                            onVerifyAuditChain = onVerifyAuditChain,
+                            onRunChaosDrill = onRunChaosDrill,
+                            onRegisterLocalNode = onRegisterLocalNode,
+                            onTriggerAutoTune = onTriggerAutoTune,
+                            onCreateDrSnapshot = onCreateDrSnapshot,
+                            onRestoreDrSnapshot = onRestoreDrSnapshot,
+                            onPingDeadmanSwitch = onPingDeadmanSwitch
                         )
                     }
                 }
@@ -456,11 +474,20 @@ private fun OrchestrationAutomationCard(
                             text = lastResult.summary,
                             style = MaterialTheme.typography.labelMedium
                         )
-                        if (lastResult.traceId.isNotBlank()) {
+                        if (lastResult.traceId.isNotBlank() || lastResult.traceparent.isNotBlank()) {
+                            val tpShort = if (lastResult.traceparent.isNotBlank()) " • tp: ${lastResult.traceparent.take(22)}..." else ""
                             Text(
-                                text = "Trace ID: ${lastResult.traceId}",
+                                text = "Trace ID: ${lastResult.traceId}$tpShort",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        if (lastResult.aiConfidence != null || lastResult.aiReasoning.isNotBlank()) {
+                            val pct = lastResult.aiConfidence?.let { "${(it * 100).toInt()}%" } ?: "-"
+                            Text(
+                                text = "SAIF 信頼度: $pct • ${lastResult.aiReasoning.take(120)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         if (lastResult.detail.isNotBlank()) {
@@ -484,8 +511,10 @@ private fun resolveGitHubFilePath(template: StackTemplate): String? = when (temp
     "github_actions_terraform" -> ".github/workflows/antigravity-terraform.yml"
     "github_actions_orchestrator" -> ".github/workflows/antigravity-orchestrator.yml"
     "github_actions_deploy" -> ".github/workflows/antigravity-deploy.yml"
+    "governance_policy_json" -> "governance-policy.json"
     "cf_email_autofix_worker" -> "worker/src/worker.js"
     "wrangler_email_selfheal" -> "worker/wrangler.toml"
+    "dr_bootstrap_script" -> "scripts/bootstrap-dr.sh"
     "cf_worker_gc2223" -> "src/worker.js"
     "wrangler_toml_gc2223" -> "wrangler.toml"
     else -> null
