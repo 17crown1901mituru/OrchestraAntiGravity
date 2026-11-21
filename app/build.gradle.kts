@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import groovy.json.JsonSlurper
 
 plugins {
   alias(libs.plugins.android.application)
@@ -8,16 +9,58 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+val appId = "com.gc2223.antigravity"
+val googleServicesFile = layout.projectDirectory.file("google-services.json").asFile
+val webClientIdFromJson: String =
+    if (googleServicesFile.exists()) {
+      runCatching {
+            val root = JsonSlurper().parse(googleServicesFile) as? Map<*, *>
+            val clients = (root?.get("client") as? List<*>)?.filterIsInstance<Map<*, *>>().orEmpty()
+            val matchingClient =
+                clients.firstOrNull { client ->
+                  val clientInfo = client["client_info"] as? Map<*, *>
+                  val androidInfo = clientInfo?.get("android_client_info") as? Map<*, *>
+                  androidInfo?.get("package_name")?.toString() == appId
+                } ?: clients.firstOrNull()
+            val oauthClients =
+                (matchingClient?.get("oauth_client") as? List<*>)
+                    ?.filterIsInstance<Map<*, *>>()
+                    .orEmpty()
+            oauthClients
+                .firstOrNull { (it["client_type"] as? Number)?.toInt() == 3 }
+                ?.get("client_id")
+                ?.toString()
+                ?.trim()
+                .orEmpty()
+          }
+          .getOrDefault("")
+    } else {
+      ""
+    }
+val resolvedDefaultWebClientId: String =
+    webClientIdFromJson.ifBlank {
+      providers.gradleProperty("DEFAULT_WEB_CLIENT_ID").orNull?.trim().orEmpty()
+    }.ifBlank {
+      providers.environmentVariable("DEFAULT_WEB_CLIENT_ID").orNull?.trim().orEmpty()
+    }
+val escapedDefaultWebClientId =
+    resolvedDefaultWebClientId.replace("\\", "\\\\").replace("\"", "\\\"")
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.gc2223.antigravity"
+    applicationId = appId
     minSdk = 24
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
+
+    buildConfigField("String", "DEFAULT_WEB_CLIENT_ID", "\"$escapedDefaultWebClientId\"")
+    if (!googleServicesFile.exists() && resolvedDefaultWebClientId.isNotBlank()) {
+      resValue("string", "default_web_client_id", resolvedDefaultWebClientId)
+    }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

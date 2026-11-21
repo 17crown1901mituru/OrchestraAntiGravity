@@ -424,4 +424,12 @@ class WebContextCrawlerTest {
       t.interrupt()
     }
   }
+
+  @Test
+  fun `default_web_client_id maps to BuildConfig constant and Google Services resource`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val expectedClientId = "177390746694-mujt9gfa0r7nk2jpfbo6ro0pqvql98gv.apps.googleusercontent.com"
+    assertEquals(expectedClientId, BuildConfig.DEFAULT_WEB_CLIENT_ID)
+    assertEquals(expectedClientId, com.example.auth.resolveDefaultWebClientId(context))
+  }
 }

@@ -8,6 +8,7 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import com.example.BuildConfig
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -31,7 +32,12 @@ fun attemptAutoSignIn(
     onUnauthenticated: () -> Unit,
     scope: CoroutineScope
 ) {
-    if (Firebase.auth.currentUser != null) {
+    val auth = runCatching { Firebase.auth }.getOrNull()
+    if (auth == null) {
+        onUnauthenticated()
+        return
+    }
+    if (auth.currentUser != null) {
         onAuthSuccess()
         return
     }
@@ -56,7 +62,7 @@ fun attemptAutoSignIn(
             val cred = credentialManager.getCredential(context, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
                 onAuthSuccess()
             } else {
                 onUnauthenticated()
@@ -95,7 +101,9 @@ fun onGoogleSignInClicked(
             val cred = credentialManager.getCredential(activity, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                val auth = runCatching { Firebase.auth }.getOrNull()
+                    ?: throw IllegalStateException("FirebaseAuth is not initialized.")
+                auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
                 onAuthSuccess()
             } else {
                 onAuthError("Unexpected credential type received.")
@@ -125,17 +133,22 @@ fun signOutUser(
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to clear credential state: ${e.message}")
             } finally {
-                Firebase.auth.signOut()
+                runCatching { Firebase.auth.signOut() }
                 onSignOutComplete()
             }
         }
     }
 }
 
-private fun resolveDefaultWebClientId(context: Context): String? {
+internal fun resolveDefaultWebClientId(context: Context): String? {
     val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
-    if (resId == 0) return null
-    return runCatching { context.getString(resId).trim() }
-        .getOrNull()
-        ?.takeIf { it.isNotBlank() }
+    val fromGoogleServices = if (resId != 0) {
+        runCatching { context.getString(resId).trim() }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+    } else {
+        null
+    }
+    if (fromGoogleServices != null) return fromGoogleServices
+    return BuildConfig.DEFAULT_WEB_CLIENT_ID.trim().takeIf { it.isNotBlank() }
 }
