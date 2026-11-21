@@ -16,8 +16,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: android-apk-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-apk-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-apk:
@@ -68,11 +68,11 @@ jobs:
             fi
           fi
 
-      - name: Run Unit & Robolectric Tests
-        run: gradle :app:testDebugUnitTest --no-daemon
-
-      - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+      - name: Run Unit/Robolectric Tests & Build Debug APK
+        run: >
+          gradle :app:testDebugUnitTest :app:assembleDebug
+          --no-daemon
+          -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
 
       - name: Build Signed Release APK & AAB (Optional)
         if: inputs.build_release == true
