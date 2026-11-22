@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.BridgeCallResult
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
+import com.example.data.GcpProvisioningClient
 import com.example.data.LocalSecretsStore
 import com.example.data.MultimodalSourceLoader
 import com.example.data.OrchestrationExtendedClient
@@ -30,6 +31,7 @@ import com.example.model.CrawlMode
 import com.example.model.DeviceViewportProfile
 import com.example.model.EmailRouteTarget
 import com.example.model.ExternalCredentials
+import com.example.model.GcpWizardState
 import com.example.model.InferenceTarget
 import com.example.model.OrchestrationHardeningState
 import com.example.model.OrchestrationRunResult
@@ -43,6 +45,7 @@ import com.example.model.VaultMetadata
 import com.example.model.WebCrawlPreview
 import com.example.model.WorkflowNode
 import com.example.model.WorkflowPlanResult
+import com.example.security.AppSignatureHelper
 import com.example.security.BiometricHardwareSigner
 import com.example.sync.BackgroundSyncScheduler
 import com.example.sync.SyncWorkUiState
@@ -62,6 +65,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
@@ -77,7 +81,8 @@ class HubViewModel(
     private val syncSnapshotStore: SyncSnapshotStore,
     private val bridgeClient: CloudBridgeClient,
     private val currentUserId: String,
-    private val userEmail: String
+    private val userEmail: String,
+    private val gcpClient: GcpProvisioningClient = GcpProvisioningClient()
 ) : ViewModel() {
 
     private val applicationContext = appContext.applicationContext
@@ -241,6 +246,14 @@ class HubViewModel(
 
     private val _settingsVerificationStatus = MutableStateFlow<String?>(null)
     val settingsVerificationStatus: StateFlow<String?> = _settingsVerificationStatus.asStateFlow()
+
+    private val _gcpWizardState = MutableStateFlow(
+        GcpWizardState(
+            selectedProjectId = _credentials.value.gcpProjectId,
+            signingDiagnostics = runCatching { AppSignatureHelper.readDiagnostics(applicationContext) }.getOrNull()
+        )
+    )
+    val gcpWizardState: StateFlow<GcpWizardState> = _gcpWizardState.asStateFlow()
 
     val syncSnapshotState: StateFlow<SyncStatusSnapshot> = syncSnapshotStore.observeSnapshot(currentUserId)
         .stateIn(
@@ -1778,6 +1791,458 @@ class HubViewModel(
                 .onFailure { err ->
                     _statusBanner.value = err.localizedMessage ?: "削除に失敗しました"
                 }
+        }
+    }
+
+    fun onGcpOAuthTokenAcquired(token: String) {
+        val cleanToken = token.trim()
+        if (cleanToken.isBlank()) {
+            onGcpOAuthFailed("GCP OAuth Access Token が空です")
+            return
+        }
+        _gcpWizardState.update {
+            it.copy(
+                accessToken = cleanToken,
+                oauthAuthorized = true,
+                errorMessage = null,
+                statusMessage = "Google OAuth (cloud-platform) を承認しました。GCP プロジェクトを読み込んでいます..."
+            )
+        }
+        loadGcpProjectsAndBilling()
+    }
+
+    fun onGcpOAuthFailed(message: String) {
+        _gcpWizardState.update {
+            it.copy(
+                isBusy = false,
+                errorMessage = message
+            )
+        }
+        _statusBanner.value = message
+    }
+
+    fun loadGcpProjectsAndBilling() {
+        val token = _gcpWizardState.value.accessToken
+        if (token.isBlank()) {
+            _gcpWizardState.update {
+                it.copy(errorMessage = "先に Step 1 で Google OAuth (cloud-platform) を承認してください")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            try {
+                val projectsRes = gcpClient.listProjects(token)
+                val billingRes = gcpClient.listBillingAccounts(token)
+
+                projectsRes.onFailure { err ->
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            errorMessage = err.localizedMessage ?: "GCP プロジェクト一覧の取得に失敗しました"
+                        )
+                    }
+                    return@launch
+                }
+
+                val projects = projectsRes.getOrDefault(emptyList())
+                val billingAccounts = billingRes.getOrDefault(emptyList())
+                val currentSelection = _gcpWizardState.value.selectedProjectId.ifBlank {
+                    _credentials.value.gcpProjectId
+                }
+                val resolvedSelection = when {
+                    projects.any { it.projectId == currentSelection } -> currentSelection
+                    currentSelection.isNotBlank() && projects.isEmpty() -> currentSelection
+                    projects.isNotEmpty() -> projects.first().projectId
+                    else -> currentSelection
+                }
+
+                _gcpWizardState.update {
+                    it.copy(
+                        isBusy = false,
+                        projects = projects,
+                        billingAccounts = billingAccounts,
+                        selectedProjectId = resolvedSelection,
+                        statusMessage = "${projects.size} 件の GCP プロジェクトを取得しました",
+                        errorMessage = null
+                    )
+                }
+
+                if (resolvedSelection.isNotBlank()) {
+                    refreshEnabledGcpApisInternal(token, resolvedSelection)
+                }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun selectGcpProject(projectId: String) {
+        val cleanId = projectId.trim()
+        if (cleanId.isBlank()) return
+        val updatedCreds = _credentials.value.copy(gcpProjectId = cleanId)
+        _credentials.value = updatedCreds
+        if (_vaultMetadata.value.hasStoredSecrets) {
+            secretsStore.saveForUser(currentUserId, userEmail, updatedCreds)
+        }
+        _gcpWizardState.update {
+            it.copy(
+                selectedProjectId = cleanId,
+                errorMessage = null,
+                statusMessage = "選択中 GCP プロジェクト: $cleanId"
+            )
+        }
+        val token = _gcpWizardState.value.accessToken
+        if (token.isNotBlank()) {
+            viewModelScope.launch {
+                refreshEnabledGcpApisInternal(token, cleanId)
+            }
+        }
+    }
+
+    fun createGcpProjectAndSelect(projectId: String, displayName: String) {
+        val token = _gcpWizardState.value.accessToken
+        if (token.isBlank()) {
+            _gcpWizardState.update {
+                it.copy(errorMessage = "先に Step 1 で Google OAuth (cloud-platform) を承認してください")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null, statusMessage = "GCP プロジェクト作成中...") }
+            try {
+                val res = gcpClient.createProject(token, projectId, displayName)
+                res.onSuccess { created ->
+                    val updatedList = (_gcpWizardState.value.projects.filterNot { it.projectId == created.projectId } + created)
+                        .sortedBy { it.projectId }
+                    val updatedCreds = _credentials.value.copy(gcpProjectId = created.projectId)
+                    _credentials.value = updatedCreds
+                    if (_vaultMetadata.value.hasStoredSecrets) {
+                        secretsStore.saveForUser(currentUserId, userEmail, updatedCreds)
+                    }
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            projects = updatedList,
+                            selectedProjectId = created.projectId,
+                            statusMessage = "GCP プロジェクト '${created.projectId}' を作成・選択しました",
+                            errorMessage = null
+                        )
+                    }
+                    refreshEnabledGcpApisInternal(token, created.projectId)
+                }.onFailure { err ->
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            errorMessage = err.localizedMessage ?: "GCP プロジェクト作成に失敗しました"
+                        )
+                    }
+                }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun linkGcpBillingAccount(billingAccountName: String) {
+        val token = _gcpWizardState.value.accessToken
+        val projectId = _gcpWizardState.value.selectedProjectId
+        if (token.isBlank() || projectId.isBlank()) {
+            _gcpWizardState.update {
+                it.copy(errorMessage = "OAuth 承認とプロジェクト選択を先に完了してください")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            try {
+                gcpClient.linkBillingAccount(token, projectId, billingAccountName)
+                    .onSuccess { linked ->
+                        _gcpWizardState.update {
+                            it.copy(statusMessage = "請求アカウント ($linked) を $projectId にリンクしました")
+                        }
+                        _statusBanner.value = "請求アカウントをリンクしました ($projectId)"
+                    }
+                    .onFailure { err ->
+                        _gcpWizardState.update {
+                            it.copy(errorMessage = err.localizedMessage ?: "請求リンクに失敗しました")
+                        }
+                    }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun toggleGcpApiSelection(serviceName: String) {
+        _gcpWizardState.update { state ->
+            val next = if (state.selectedApiNamesToEnable.contains(serviceName)) {
+                state.selectedApiNamesToEnable - serviceName
+            } else {
+                state.selectedApiNamesToEnable + serviceName
+            }
+            state.copy(selectedApiNamesToEnable = next)
+        }
+    }
+
+    fun refreshEnabledGcpApis() {
+        val token = _gcpWizardState.value.accessToken
+        val projectId = _gcpWizardState.value.selectedProjectId
+        if (token.isBlank() || projectId.isBlank()) return
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            try {
+                refreshEnabledGcpApisInternal(token, projectId)
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    private suspend fun refreshEnabledGcpApisInternal(token: String, projectId: String) {
+        gcpClient.listEnabledServices(token, projectId)
+            .onSuccess { enabledSet ->
+                val updatedItems = GcpProvisioningClient.recommendedApis.map { item ->
+                    item.copy(enabled = enabledSet.contains(item.serviceName))
+                }
+                _gcpWizardState.update {
+                    it.copy(
+                        apiItems = updatedItems,
+                        statusMessage = "$projectId: ${updatedItems.count { s -> s.enabled }}/${updatedItems.size} 個の推奨 API が有効です"
+                    )
+                }
+            }
+            .onFailure { err ->
+                _gcpWizardState.update {
+                    it.copy(errorMessage = err.localizedMessage ?: "API 有効状態の取得に失敗しました")
+                }
+            }
+    }
+
+    fun enableSelectedGcpApis() {
+        val state = _gcpWizardState.value
+        val token = state.accessToken
+        val projectId = state.selectedProjectId
+        val selected = state.selectedApiNamesToEnable.toList()
+        if (token.isBlank() || projectId.isBlank()) {
+            _gcpWizardState.update {
+                it.copy(errorMessage = "OAuth 承認と GCP プロジェクト選択を先に完了してください")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null, statusMessage = "選択 API を一括有効化中...") }
+            try {
+                gcpClient.batchEnableServices(token, projectId, selected)
+                    .onSuccess { enabled ->
+                        refreshEnabledGcpApisInternal(token, projectId)
+                        _gcpWizardState.update {
+                            it.copy(
+                                statusMessage = "${enabled.size} 件の API を承認・有効化しました",
+                                errorMessage = null
+                            )
+                        }
+                        _statusBanner.value = "${enabled.size} 件の GCP API を有効化しました"
+                    }
+                    .onFailure { err ->
+                        _gcpWizardState.update {
+                            it.copy(errorMessage = err.localizedMessage ?: "API 一括有効化に失敗しました")
+                        }
+                    }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun syncFirebaseForSelectedProject() {
+        val state = _gcpWizardState.value
+        val token = state.accessToken
+        val projectId = state.selectedProjectId
+        if (token.isBlank() || projectId.isBlank()) {
+            _gcpWizardState.update {
+                it.copy(errorMessage = "OAuth 承認と GCP プロジェクト選択を先に完了してください")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _gcpWizardState.update {
+                it.copy(isBusy = true, errorMessage = null, statusMessage = "Firebase 有効化・APK SHA 登録・Android 設定同期中...")
+            }
+            try {
+                val diag = AppSignatureHelper.readDiagnostics(applicationContext)
+                val creds = _credentials.value
+                gcpClient.ensureFirebaseAndFetchAndroidConfig(
+                    accessToken = token,
+                    projectId = projectId,
+                    packageName = applicationContext.packageName,
+                    existingGatewayUrl = creds.gc2223Endpoint,
+                    sha1 = diag.sha1,
+                    sha256 = diag.sha256
+                ).onSuccess { syncRes ->
+                    val bootstrapStore = RuntimeCloudBootstrapStore(applicationContext)
+                    val mergedBootstrap = syncRes.bootstrapConfig.copy(
+                        defaultGithubRepo = creds.githubOwnerRepo.ifBlank { syncRes.bootstrapConfig.defaultGithubRepo }
+                    )
+                    bootstrapStore.save(mergedBootstrap)
+                    val updatedCreds = creds.copy(gcpProjectId = syncRes.projectId)
+                    saveCredentials(updatedCreds)
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            firebaseSynced = true,
+                            lastFirebaseAppId = syncRes.androidAppId,
+                            registeredShaCount = syncRes.registeredShaCount,
+                            signingDiagnostics = diag,
+                            statusMessage = "Firebase Android App (${syncRes.androidAppId}) と署名 SHA (${syncRes.registeredShaCount}件) を同期しました",
+                            errorMessage = null
+                        )
+                    }
+                    _statusBanner.value = "Firebase 構成・APK 署名 SHA 証明書を同期しました"
+                }.onFailure { err ->
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            errorMessage = err.localizedMessage ?: "Firebase 同期に失敗しました"
+                        )
+                    }
+                }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun exportPortableBootstrapJson(): String {
+        val bootstrap = RuntimeCloudBootstrapStore(applicationContext).load()
+        val creds = _credentials.value
+        val merged = bootstrap.copy(
+            gatewayUrl = creds.gc2223Endpoint.ifBlank { bootstrap.gatewayUrl },
+            firebaseProjectId = creds.gcpProjectId.ifBlank { bootstrap.firebaseProjectId },
+            defaultGithubRepo = creds.githubOwnerRepo.ifBlank { bootstrap.defaultGithubRepo }
+        )
+        return RuntimeCloudBootstrapStore.exportPortableJson(merged)
+    }
+
+    fun applyWizardToWorkflowNodesAndSync(
+        gatewayUrl: String,
+        githubOwnerRepo: String,
+        termuxAgentUrl: String
+    ) {
+        val wiz = _gcpWizardState.value
+        val currentCreds = _credentials.value
+        val effectiveProject = wiz.selectedProjectId.ifBlank { currentCreds.gcpProjectId }
+        val updatedCreds = currentCreds.copy(
+            gcpProjectId = effectiveProject,
+            gc2223Endpoint = gatewayUrl.trim().trimEnd('/').ifBlank { currentCreds.gc2223Endpoint },
+            githubOwnerRepo = githubOwnerRepo.trim().ifBlank { currentCreds.githubOwnerRepo },
+            termuxAgentUrl = termuxAgentUrl.trim().trimEnd('/').ifBlank { currentCreds.termuxAgentUrl }
+        )
+        saveCredentials(updatedCreds)
+
+        val bootstrapStore = RuntimeCloudBootstrapStore(applicationContext)
+        val existingBootstrap = bootstrapStore.load()
+        bootstrapStore.save(
+            existingBootstrap.copy(
+                gatewayUrl = updatedCreds.gc2223Endpoint,
+                firebaseProjectId = effectiveProject.ifBlank { existingBootstrap.firebaseProjectId },
+                defaultGithubRepo = updatedCreds.githubOwnerRepo
+            )
+        )
+
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            try {
+                val idToken = fetchFirebaseIdToken()
+                val currentNodes = (nodesState.value as? StreamUiState.Success)?.data.orEmpty()
+                val enabledCount = wiz.apiItems.count { it.enabled }
+
+                for (node in currentNodes) {
+                    when (node.provider) {
+                        "GCP" -> {
+                            val st = if (wiz.oauthAuthorized && effectiveProject.isNotBlank()) "ACTIVE" else "CONFIGURED"
+                            val note = if (wiz.oauthAuthorized) {
+                                "Project: $effectiveProject (有効API ${enabledCount}/${wiz.apiItems.size})"
+                            } else {
+                                "Project: $effectiveProject"
+                            }
+                            repository.updateNodeStatus(currentUserId, node.id, st, effectiveProject, note)
+                        }
+                        "FIREBASE" -> {
+                            val st = if (wiz.firebaseSynced) "ACTIVE" else node.status
+                            val note = if (wiz.firebaseSynced) {
+                                "App: ${wiz.lastFirebaseAppId} / SHA同期済み (${wiz.registeredShaCount}件)"
+                            } else {
+                                node.lastCheckedNote
+                            }
+                            repository.updateNodeStatus(currentUserId, node.id, st, effectiveProject, note)
+                        }
+                        "CLOUDFLARE" -> {
+                            val gwRes = bridgeClient.pingGc2223Gateway(
+                                baseUrl = updatedCreds.gc2223Endpoint,
+                                bearerToken = updatedCreds.gc2223BearerToken,
+                                firebaseIdToken = idToken
+                            )
+                            repository.updateNodeStatus(
+                                currentUserId,
+                                node.id,
+                                if (gwRes.success) "ACTIVE" else "CONFIGURED",
+                                updatedCreds.gc2223Endpoint,
+                                gwRes.message
+                            )
+                        }
+                        "GITHUB" -> {
+                            val ghStatus = bridgeClient.fetchGitHubSyncStatus(
+                                pat = updatedCreds.githubPat,
+                                ownerRepo = updatedCreds.githubOwnerRepo,
+                                workflowFile = updatedCreds.githubWorkflowFile,
+                                gatewayUrl = updatedCreds.gc2223Endpoint,
+                                bearerToken = updatedCreds.gc2223BearerToken,
+                                firebaseIdToken = idToken
+                            )
+                            val st = when (ghStatus.health) {
+                                com.example.model.SyncHealthState.CONNECTED -> "ACTIVE"
+                                com.example.model.SyncHealthState.ERROR -> "ERROR"
+                                else -> "CONFIGURED"
+                            }
+                            repository.updateNodeStatus(
+                                currentUserId,
+                                node.id,
+                                st,
+                                updatedCreds.githubOwnerRepo.ifBlank { node.endpointOrTarget },
+                                ghStatus.summaryMessage
+                            )
+                        }
+                        "TERMUX" -> {
+                            val tmStatus = bridgeClient.fetchTermuxAgentStatus(
+                                updatedCreds.termuxAgentUrl,
+                                updatedCreds.termuxAgentToken
+                            )
+                            val st = if (tmStatus.health == com.example.model.SyncHealthState.CONNECTED) "ACTIVE" else "CONFIGURED"
+                            repository.updateNodeStatus(
+                                currentUserId,
+                                node.id,
+                                st,
+                                updatedCreds.termuxAgentUrl,
+                                tmStatus.summaryMessage
+                            )
+                        }
+                    }
+                }
+
+                triggerBackgroundSyncNow()
+                triggerTermuxSyncNow()
+                _gcpWizardState.update {
+                    it.copy(
+                        isBusy = false,
+                        statusMessage = "全ワークフローノード (GCP / Firebase / Cloudflare / GitHub / Termux) へ反映・同期しました",
+                        errorMessage = null
+                    )
+                }
+                _statusBanner.value = "全ワークフロー連携を反映・同期しました"
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
         }
     }
 }

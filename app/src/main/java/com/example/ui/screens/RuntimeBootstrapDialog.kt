@@ -108,22 +108,25 @@ fun RuntimeBootstrapDialog(
     }
 
     fun applyParsedJson(jsonText: String) {
-        RuntimeCloudBootstrapStore.parseGoogleServicesJson(
+        RuntimeCloudBootstrapStore.importPortableOrGoogleServicesJson(
             rawJson = jsonText,
             targetPackageName = context.packageName,
             existingGatewayUrl = gatewayUrl
         ).onSuccess { parsed ->
             val merged = parsed.copy(
-                firestoreDatabaseId = dbId.ifBlank { "(default)" },
-                defaultGithubRepo = defaultRepo.trim()
+                firestoreDatabaseId = parsed.firestoreDatabaseId.ifBlank { dbId.ifBlank { "(default)" } },
+                defaultGithubRepo = parsed.defaultGithubRepo.ifBlank { defaultRepo.trim() }
             )
+            gatewayUrl = merged.gatewayUrl.ifBlank { gatewayUrl }
             projectId = merged.firebaseProjectId
             appId = merged.firebaseAppId
             apiKey = merged.firebaseApiKey
             webClientId = merged.firebaseWebClientId
+            dbId = merged.firestoreDatabaseId
+            defaultRepo = merged.defaultGithubRepo
             saveAndFinish(merged)
         }.onFailure { err ->
-            errorMessage = err.localizedMessage ?: "google-services.json の解析に失敗しました"
+            errorMessage = err.localizedMessage ?: "google-services.json / バックアップ JSON の解析に失敗しました"
         }
     }
 

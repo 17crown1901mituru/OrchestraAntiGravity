@@ -89,8 +89,9 @@ enum class HubTab(
 }
 
 private enum class StatusSubTab(val label: String, val testTag: String) {
-    DASHBOARD("同期ダッシュボード", "subtab_status_dashboard"),
-    NODES("連携ノード", "subtab_nodes_list")
+    DASHBOARD("同期", "subtab_status_dashboard"),
+    NODES("ノード", "subtab_nodes_list"),
+    WIZARD("GCP連携", "subtab_setup_wizard")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -140,6 +141,7 @@ fun MainHubScreen(
     val syncSnapshot by viewModel.syncSnapshotState.collectAsStateWithLifecycle()
     val syncSettings by viewModel.syncSettingsState.collectAsStateWithLifecycle()
     val syncWorkState by viewModel.syncWorkState.collectAsStateWithLifecycle()
+    val gcpWizardState by viewModel.gcpWizardState.collectAsStateWithLifecycle()
 
     LaunchedEffect(statusBanner) {
         val msg = statusBanner
@@ -383,6 +385,7 @@ fun MainHubScreen(
                                     nodesState = nodesState,
                                     isBusy = isBusyNodeAction,
                                     onOpenSettings = { showSettingsScreen = true },
+                                    onOpenSetupWizard = { statusSubTab = StatusSubTab.WIZARD },
                                     onTestGc2223Health = viewModel::testGc2223Health,
                                     onVerifyCloudflare = viewModel::verifyCloudflareNode,
                                     onVerifyGitHub = { node -> viewModel.verifyOrDispatchGitHub(node, dispatch = false) },
@@ -393,6 +396,36 @@ fun MainHubScreen(
                                         showSelfHealDialog = true
                                     },
                                     onMarkNodeActive = viewModel::updateGcpOrTermuxStatus
+                                )
+
+                                StatusSubTab.WIZARD -> WorkflowSetupWizardScreen(
+                                    userEmail = userEmail,
+                                    wizardState = gcpWizardState,
+                                    credentials = credentials,
+                                    onOAuthTokenAcquired = viewModel::onGcpOAuthTokenAcquired,
+                                    onOAuthError = viewModel::onGcpOAuthFailed,
+                                    onLoadProjects = viewModel::loadGcpProjectsAndBilling,
+                                    onSelectProject = viewModel::selectGcpProject,
+                                    onCreateProject = viewModel::createGcpProjectAndSelect,
+                                    onLinkBillingAccount = viewModel::linkGcpBillingAccount,
+                                    onToggleApiSelection = viewModel::toggleGcpApiSelection,
+                                    onRefreshApis = viewModel::refreshEnabledGcpApis,
+                                    onEnableSelectedApis = viewModel::enableSelectedGcpApis,
+                                    onSyncFirebase = viewModel::syncFirebaseForSelectedProject,
+                                    onExportPortableBackupJson = viewModel::exportPortableBootstrapJson,
+                                    onApplyAllWorkflows = viewModel::applyWizardToWorkflowNodesAndSync,
+                                    onVerifyCloudflareGateway = { url ->
+                                        viewModel.verifyGc2223FromSettings(url, credentials.gc2223BearerToken)
+                                    },
+                                    onVerifyGitHubSso = {
+                                        viewModel.verifyGitHubFromSettings(credentials.githubPat)
+                                    },
+                                    onVerifyTermux = { url ->
+                                        viewModel.verifyTermuxFromSettings(url, credentials.termuxAgentToken)
+                                    },
+                                    onShowMessage = { msg ->
+                                        scope.launch { snackbarHostState.showSnackbar(msg) }
+                                    }
                                 )
                             }
                         }

@@ -50,30 +50,29 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Restore or generate debug keystore
+      - name: Restore deterministic debug keystore (prevent signing conflicts)
         env:
           ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
         run: |
-          if [ ! -f debug.keystore ]; then
-            if [ -f debug.keystore.base64 ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
-              echo "Restored debug.keystore from debug.keystore.base64."
-            elif [ -n "${ANDROID_DEBUG_KEYSTORE_BASE64}" ]; then
-              echo "${ANDROID_DEBUG_KEYSTORE_BASE64}" | base64 -d > debug.keystore
-              echo "Restored debug.keystore from ANDROID_DEBUG_KEYSTORE_BASE64 secret."
-            else
-              echo "debug.keystore.base64 not found; generating ephemeral debug.keystore..."
-              keytool -genkeypair -v \
-                -keystore debug.keystore \
-                -storepass android \
-                -alias androiddebugkey \
-                -keypass android \
-                -keyalg RSA \
-                -keysize 2048 \
-                -validity 10000 \
-                -dname "CN=Android Debug,O=Android,C=US"
-            fi
+          if [ -n "${ANDROID_DEBUG_KEYSTORE_BASE64}" ]; then
+            echo "${ANDROID_DEBUG_KEYSTORE_BASE64}" | base64 -d > debug.keystore
+            echo "Restored deterministic debug.keystore from ANDROID_DEBUG_KEYSTORE_BASE64 secret."
+          elif [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "Restored deterministic debug.keystore from repository debug.keystore.base64."
+          elif [ ! -f debug.keystore ]; then
+            echo "::warning::debug.keystore.base64 and ANDROID_DEBUG_KEYSTORE_BASE64 missing; generating ephemeral debug.keystore (will conflict with previous builds on reinstall)."
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
+          keytool -list -v -keystore debug.keystore -alias androiddebugkey -storepass android | grep -E "SHA1:|SHA256:" || true
 
       - name: Restore google-services.json (from Secrets if omitted in Git)
         env:
@@ -95,6 +94,8 @@ jobs:
       - name: Build Debug APK directly
         run: >
           gradle :app:assembleDebug
+          -PappVersionCode=${{ github.run_number }}
+          -PappVersionName=1.0.${{ github.run_number }}
           --no-daemon
           -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
 
@@ -117,8 +118,27 @@ jobs:
             exit 0
           fi
           echo "${ANDROID_KEYSTORE_BASE64}" | base64 -d > my-upload-key.jks
-          gradle :app:assembleRelease :app:bundleRelease --no-daemon
+          gradle :app:assembleRelease :app:bundleRelease \
+            -PappVersionCode=${{ github.run_number }} \
+            -PappVersionName=1.0.${{ github.run_number }} \
+            --no-daemon
           rm -f my-upload-key.jks
+
+      - name: Verify APK Signing Certificates & Publish Summary
+        run: |
+          APKSIGNER="${ANDROID_HOME}/build-tools/36.0.0/apksigner"
+          {
+            echo "## AntiGravity APK Signing & Reinstall Check"
+            echo "- Package ID: \`com.gc2223.antigravity\`"
+            echo "- Version Code: \`${{ github.run_number }}\` (\`1.0.${{ github.run_number }}\`)"
+            for apk in app/build/outputs/apk/*/*.apk; do
+              [ -f "$apk" ] || continue
+              echo "### $(basename "$apk")"
+              "$APKSIGNER" verify --print-certs "$apk" | sed 's/^/- /'
+            done
+            echo ""
+            echo "> **再インストール時の署名衝突対策**: Debug APK は共通 \`debug.keystore\` で決定的に署名されています。Release 署名や別環境の鍵でビルドされた APK から切り替える場合は、アプリ内の「再導入用バックアップ」を保存した上で \`scripts/install_apk_safe.sh --reinstall-on-conflict <apk>\` を使用してください。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4

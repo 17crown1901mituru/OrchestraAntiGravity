@@ -216,9 +216,16 @@ fi
 # 2. Keystore Restoration & Release SHA-256 Inspection (App Check / Play Integrity)
 # ==============================================================================
 log "Checking Android keystores..."
-if [[ ! -f "${REPO_ROOT}/debug.keystore" && -f "${REPO_ROOT}/debug.keystore.base64" ]]; then
-  base64 -d "${REPO_ROOT}/debug.keystore.base64" > "${REPO_ROOT}/debug.keystore"
-  log "Restored debug.keystore from debug.keystore.base64."
+if [[ -f "${REPO_ROOT}/debug.keystore.base64" ]]; then
+  TMP_KS="$(mktemp)"
+  base64 -d "${REPO_ROOT}/debug.keystore.base64" > "$TMP_KS"
+  if [[ ! -f "${REPO_ROOT}/debug.keystore" ]] || ! cmp -s "$TMP_KS" "${REPO_ROOT}/debug.keystore"; then
+    mv "$TMP_KS" "${REPO_ROOT}/debug.keystore"
+    log "Synchronized debug.keystore cleanly with debug.keystore.base64 (prevents signing conflicts)."
+  else
+    rm -f "$TMP_KS"
+    log "debug.keystore matches debug.keystore.base64."
+  fi
 fi
 
 RELEASE_KEYSTORE="${KEYSTORE_PATH:-${REPO_ROOT}/my-upload-key.jks}"
@@ -475,11 +482,15 @@ log "Executing: ${GRADLE_CMD} ${GRADLE_TASKS[*]} ${GRADLE_ARGS[*]}"
 log "Build artifacts:"
 find "${REPO_ROOT}/app/build/outputs" -type f \( -name "*.apk" -o -name "*.aab" \) 2>/dev/null | while read -r artifact; do
   if command -v sha256sum >/dev/null 2>&1; then
-    printf '  %s\n    sha256: %s\n' "$artifact" "$(sha256sum "$artifact" | awk '{print $1}')"
+    printf '  %s\n    file sha256: %s\n' "$artifact" "$(sha256sum "$artifact" | awk '{print $1}')"
   else
     printf '  %s\n' "$artifact"
   fi
+  if [[ "$artifact" == *.apk ]] && command -v apksigner >/dev/null 2>&1; then
+    apksigner verify --print-certs "$artifact" 2>/dev/null | sed 's/^/    /' || true
+  fi
 done
+log "Safe reinstall helper: bash scripts/install_apk_safe.sh [--reinstall-on-conflict] <apk-path>"
 
 # ==============================================================================
 # 6. Post-Deployment Endpoint Health Verification

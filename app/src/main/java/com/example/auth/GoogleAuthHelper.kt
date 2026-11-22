@@ -2,7 +2,9 @@ package com.example.auth
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.util.Log
+import androidx.activity.result.IntentSenderRequest
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
@@ -10,6 +12,9 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import com.example.BuildConfig
 import com.example.data.RuntimeCloudBootstrapStore
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.Scope
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -25,6 +30,7 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 private const val TAG = "GoogleAuthHelper"
+const val GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 fun attemptAutoSignIn(
     context: Context,
@@ -86,7 +92,7 @@ fun onGoogleSignInClicked(
 ) {
     val clientId = resolveDefaultWebClientId(context)
     if (clientId == null) {
-        onAuthError("Google Sign-In 設定不足: google-services.json (default_web_client_id) を配置してビルドしてください")
+        onAuthError("有効な Web Client ID (default_web_client_id) が設定されていません。接続設定または google-services.json を確認してください。")
         return
     }
 
@@ -110,7 +116,6 @@ fun onGoogleSignInClicked(
                 onAuthError("Unexpected credential type received.")
             }
         } catch (e: CancellationException) {
-            // Preserve cooperative cancellation (e.g., AuthScreen leaving composition after AuthStateListener fires)
             throw e
         } catch (e: GetCredentialCancellationException) {
             Log.w(TAG, "Google Sign-In cancelled or dismissed: ${e.message}", e)
@@ -141,20 +146,72 @@ fun signOutUser(
     }
 }
 
+fun requestGcpOAuthAuthorization(
+    activity: Activity,
+    onAccessToken: (String) -> Unit,
+    onResolutionRequired: (IntentSenderRequest) -> Unit,
+    onError: (String) -> Unit
+) {
+    val authRequest = AuthorizationRequest.builder()
+        .setRequestedScopes(listOf(Scope(GCP_CLOUD_PLATFORM_SCOPE)))
+        .build()
+
+    Identity.getAuthorizationClient(activity)
+        .authorize(authRequest)
+        .addOnSuccessListener { result ->
+            if (result.hasResolution()) {
+                val pendingIntent = result.pendingIntent
+                if (pendingIntent != null) {
+                    onResolutionRequired(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                } else {
+                    onError("Google OAuth 承認画面を起動できませんでした (PendingIntent null)")
+                }
+            } else {
+                val token = result.accessToken
+                if (!token.isNullOrBlank()) {
+                    onAccessToken(token)
+                } else {
+                    onError("GCP OAuth Access Token を取得できませんでした")
+                }
+            }
+        }
+        .addOnFailureListener { e ->
+            Log.w(TAG, "GCP OAuth authorization request failed", e)
+            onError(e.localizedMessage ?: "GCP OAuth 承認に失敗しました")
+        }
+}
+
+fun extractGcpAccessTokenFromIntent(context: Context, data: Intent?): Result<String> = runCatching {
+    val result = Identity.getAuthorizationClient(context).getAuthorizationResultFromIntent(data)
+    val token = result.accessToken
+    require(!token.isNullOrBlank()) { "承認結果に GCP Access Token が含まれていません" }
+    token
+}
+
+internal fun validateWebClientId(rawClientId: String?): String? {
+    val candidate = rawClientId?.trim().orEmpty()
+    if (candidate.isBlank()) return null
+    if (!candidate.endsWith(".apps.googleusercontent.com")) return null
+    val prefix = candidate.removeSuffix(".apps.googleusercontent.com")
+    if (prefix.length < 6 || prefix.contains("YOUR_", ignoreCase = true) || prefix.contains("PLACEHOLDER", ignoreCase = true)) {
+        return null
+    }
+    return candidate
+}
+
 internal fun resolveDefaultWebClientId(context: Context): String? {
     val runtimeClientId = runCatching {
-        RuntimeCloudBootstrapStore(context).load().firebaseWebClientId.trim()
-    }.getOrNull()?.takeIf { it.isNotBlank() }
+        validateWebClientId(RuntimeCloudBootstrapStore(context).load().firebaseWebClientId)
+    }.getOrNull()
     if (runtimeClientId != null) return runtimeClientId
 
     val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
     val fromGoogleServices = if (resId != 0) {
-        runCatching { context.getString(resId).trim() }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() }
+        runCatching { validateWebClientId(context.getString(resId)) }.getOrNull()
     } else {
         null
     }
     if (fromGoogleServices != null) return fromGoogleServices
-    return BuildConfig.DEFAULT_WEB_CLIENT_ID.trim().takeIf { it.isNotBlank() }
+
+    return validateWebClientId(BuildConfig.DEFAULT_WEB_CLIENT_ID)
 }

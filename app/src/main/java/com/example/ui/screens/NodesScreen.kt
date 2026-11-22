@@ -51,6 +51,7 @@ fun NodesScreen(
     nodesState: StreamUiState<List<WorkflowNode>>,
     isBusy: Boolean,
     onOpenSettings: () -> Unit,
+    onOpenSetupWizard: () -> Unit = {},
     onTestGc2223Health: (WorkflowNode) -> Unit,
     onVerifyCloudflare: (WorkflowNode) -> Unit,
     onVerifyGitHub: (WorkflowNode) -> Unit,
@@ -94,6 +95,17 @@ fun NodesScreen(
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("暗号化設定")
                 }
+            }
+
+            Button(
+                onClick = onOpenSetupWizard,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("open_gcp_setup_wizard_button"),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text("Google → GCP プロジェクト / API / 全ワークフロー連携ウィザード")
             }
 
             if (isBusy) {

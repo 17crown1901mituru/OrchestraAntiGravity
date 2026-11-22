@@ -254,5 +254,46 @@ class RuntimeCloudBootstrapStore(context: Context) {
                 storageBucket = storageBucket
             )
         }
+
+        fun exportPortableJson(config: RuntimeCloudBootstrapConfig): String =
+            JSONObject().apply {
+                put("format", "antigravity-bootstrap-v1")
+                put("gatewayUrl", config.gatewayUrl.trim().trimEnd('/'))
+                put("firebaseProjectId", config.firebaseProjectId.trim())
+                put("firebaseAppId", config.firebaseAppId.trim())
+                put("firebaseApiKey", config.firebaseApiKey.trim())
+                put("firebaseWebClientId", config.firebaseWebClientId.trim())
+                put("firestoreDatabaseId", config.firestoreDatabaseId.trim().ifBlank { "(default)" })
+                put("storageBucket", config.storageBucket.trim())
+                put("defaultGithubRepo", config.defaultGithubRepo.trim())
+            }.toString(2)
+
+        fun importPortableOrGoogleServicesJson(
+            rawJson: String,
+            targetPackageName: String,
+            existingGatewayUrl: String = ""
+        ): Result<RuntimeCloudBootstrapConfig> {
+            val trimmed = rawJson.trim()
+            val asJson = runCatching { JSONObject(trimmed) }.getOrNull()
+            if (asJson != null && asJson.optString("format").startsWith("antigravity-bootstrap")) {
+                return runCatching {
+                    val cfg = RuntimeCloudBootstrapConfig(
+                        gatewayUrl = asJson.optString("gatewayUrl", existingGatewayUrl).trim().trimEnd('/'),
+                        firebaseProjectId = asJson.optString("firebaseProjectId", "").trim(),
+                        firebaseAppId = asJson.optString("firebaseAppId", "").trim(),
+                        firebaseApiKey = asJson.optString("firebaseApiKey", "").trim(),
+                        firebaseWebClientId = asJson.optString("firebaseWebClientId", "").trim(),
+                        firestoreDatabaseId = asJson.optString("firestoreDatabaseId", "(default)").ifBlank { "(default)" },
+                        storageBucket = asJson.optString("storageBucket", "").trim(),
+                        defaultGithubRepo = asJson.optString("defaultGithubRepo", "").trim()
+                    )
+                    require(cfg.hasFirebaseRuntimeParams()) {
+                        "バックアップ JSON に必須の Firebase 項目 (Project ID / App ID / API Key) がありません"
+                    }
+                    cfg
+                }
+            }
+            return parseGoogleServicesJson(trimmed, targetPackageName, existingGatewayUrl)
+        }
     }
 }

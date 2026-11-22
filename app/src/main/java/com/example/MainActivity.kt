@@ -1,10 +1,13 @@
 package com.example
 
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -17,13 +20,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
 import com.example.data.RuntimeCloudBootstrapStore
 import com.example.data.SyncSnapshotStore
 import com.example.firebase.configureAppCheck
-import com.example.ui.screens.AuthScreen
+import com.example.ui.screens.LoginScreen
 import com.example.ui.screens.MainHubScreen
 import com.example.ui.theme.AntiGravityTheme
 import com.example.ui.viewmodel.HubViewModel
@@ -37,6 +43,9 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOf
+
+const val ROUTE_LOGIN = "login"
+const val ROUTE_MAIN_HUB = "main_hub"
 
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,6 +74,7 @@ internal fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
 @Composable
 fun AppNavigation(auth: FirebaseAuth? = null) {
     val context = LocalContext.current
+    val navController = rememberNavController()
     var bootstrapRevision by remember { mutableIntStateOf(0) }
 
     val resolvedAuth = remember(auth, context, bootstrapRevision) {
@@ -80,44 +90,89 @@ fun AppNavigation(auth: FirebaseAuth? = null) {
     val user by currentUserFlow.collectAsStateWithLifecycle(initialValue = resolvedAuth?.currentUser)
 
     val activeUser = user
-    if (activeUser == null || resolvedAuth == null) {
-        AuthScreen(
-            onAuthSuccess = {},
-            isFirebaseReady = resolvedAuth != null,
-            onFirebaseInitialized = {
-                configureAppCheck(context, (context as? Activity)?.intent)
-                bootstrapRevision++
+    val isAuthenticated = activeUser != null && resolvedAuth != null
+    val initialDestination = remember {
+        if (isAuthenticated) ROUTE_MAIN_HUB else ROUTE_LOGIN
+    }
+
+    LaunchedEffect(isAuthenticated) {
+        val currentRoute = navController.currentBackStackEntry?.destination?.route
+        if (isAuthenticated && currentRoute != ROUTE_MAIN_HUB) {
+            navController.navigate(ROUTE_MAIN_HUB) {
+                popUpTo(ROUTE_LOGIN) { inclusive = true }
+                launchSingleTop = true
             }
-        )
-    } else {
-        val uid = activeUser.uid
-        val email = activeUser.email.orEmpty()
-        key(uid) {
-            val hubViewModel: HubViewModel = viewModel(
-                key = uid,
-                factory = viewModelFactory {
-                    initializer {
-                        val app = checkNotNull(this[APPLICATION_KEY]) {
-                            "APPLICATION_KEY missing from CreationExtras"
-                        }
-                        val databaseId = RuntimeCloudBootstrapStore.resolveDatabaseId(app)
-                        val db = FirebaseFirestore.getInstance(databaseId)
-                        HubViewModel(
-                            appContext = app,
-                            repository = FirestoreRepository(db, resolvedAuth),
-                            secretsStore = LocalSecretsStore(app),
-                            syncSnapshotStore = SyncSnapshotStore(app),
-                            bridgeClient = CloudBridgeClient(),
-                            currentUserId = uid,
-                            userEmail = email
-                        )
-                    }
-                }
-            )
-            MainHubScreen(
-                viewModel = hubViewModel,
-                userEmail = email
-            )
+        } else if (!isAuthenticated && currentRoute != ROUTE_LOGIN) {
+            navController.navigate(ROUTE_LOGIN) {
+                popUpTo(ROUTE_MAIN_HUB) { inclusive = true }
+                launchSingleTop = true
+            }
         }
     }
+
+    NavHost(
+        navController = navController,
+        startDestination = initialDestination
+    ) {
+        composable(ROUTE_LOGIN) {
+            LoginScreen(
+                onAuthSuccess = {
+                    bootstrapRevision++
+                    if (navController.currentBackStackEntry?.destination?.route != ROUTE_MAIN_HUB) {
+                        navController.navigate(ROUTE_MAIN_HUB) {
+                            popUpTo(ROUTE_LOGIN) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
+                },
+                isFirebaseReady = resolvedAuth != null,
+                onFirebaseInitialized = {
+                    configureAppCheck(context, context.findHostActivity()?.intent)
+                    bootstrapRevision++
+                }
+            )
+        }
+
+        composable(ROUTE_MAIN_HUB) {
+            val signedInUser = activeUser
+            val firebaseAuth = resolvedAuth
+            if (signedInUser != null && firebaseAuth != null) {
+                val uid = signedInUser.uid
+                val email = signedInUser.email.orEmpty()
+                key(uid) {
+                    val hubViewModel: HubViewModel = viewModel(
+                        key = uid,
+                        factory = viewModelFactory {
+                            initializer {
+                                val app = checkNotNull(this[APPLICATION_KEY]) {
+                                    "APPLICATION_KEY missing from CreationExtras"
+                                }
+                                val databaseId = RuntimeCloudBootstrapStore.resolveDatabaseId(app)
+                                val db = FirebaseFirestore.getInstance(databaseId)
+                                HubViewModel(
+                                    appContext = app,
+                                    repository = FirestoreRepository(db, firebaseAuth),
+                                    secretsStore = LocalSecretsStore(app),
+                                    syncSnapshotStore = SyncSnapshotStore(app),
+                                    bridgeClient = CloudBridgeClient(),
+                                    currentUserId = uid,
+                                    userEmail = email
+                                )
+                            }
+                        }
+                    )
+                    MainHubScreen(
+                        viewModel = hubViewModel,
+                        userEmail = email
+                    )
+                }
+            }
+        }
+    }
+}
+
+private tailrec fun Context.findHostActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findHostActivity()
+    else -> null
 }

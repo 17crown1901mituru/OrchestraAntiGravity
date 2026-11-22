@@ -54,8 +54,12 @@ android {
     applicationId = appId
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    val resolvedVersionCode =
+        providers.gradleProperty("appVersionCode").orNull?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+    val resolvedVersionName =
+        providers.gradleProperty("appVersionName").orNull?.trim().orEmpty().ifBlank { "1.0" }
+    versionCode = resolvedVersionCode
+    versionName = resolvedVersionName
 
     buildConfigField("String", "DEFAULT_WEB_CLIENT_ID", "\"$escapedDefaultWebClientId\"")
     if (!googleServicesFile.exists() && resolvedDefaultWebClientId.isNotBlank()) {
@@ -160,6 +164,7 @@ dependencies {
   implementation(libs.androidx.credentials)
   implementation(libs.androidx.credentials.play.services)
   implementation(libs.googleid)
+  implementation(libs.play.services.auth)
   implementation(libs.firebase.appcheck.recaptcha)
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
