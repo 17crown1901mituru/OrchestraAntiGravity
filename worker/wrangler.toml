@@ -1,14 +1,17 @@
 name = "antigravity-stateless-mcp"
+account_id = "3e877e6b21aadb5d208212e13e63b7bb"
 main = "src/worker.js"
 compatibility_date = "2026-11-01"
 workers_dev = false
+
+routes = [
+  { pattern = "gc2223.com/mcp*", zone_name = "gc2223.com" },
+  { pattern = "gc2223.com/v1/*", zone_name = "gc2223.com" },
+  { pattern = "gc2223.com/health", zone_name = "gc2223.com" }
+]
 
 [vars]
 STATELESS_MCP_MODE = "true"
 MCP_ROUTE = "gc2223.com/*"
 MAX_REQUESTS_PER_MINUTE = "60"
 VERIFY_GOOGLE_JWKS = "false"
-
-# Zero-PII Policy:
-# Do NOT declare kv_namespaces, r2_buckets, d1_databases, durable_objects,
-# or any single-user credentials/emails/tokens in environment variables.
