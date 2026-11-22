@@ -31,6 +31,24 @@ import kotlinx.coroutines.withContext
 
 private const val TAG = "GoogleAuthHelper"
 const val GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+private const val SCOPE_OPENID = "openid"
+private const val SCOPE_EMAIL = "https://www.googleapis.com/auth/userinfo.email"
+private const val SCOPE_PROFILE = "https://www.googleapis.com/auth/userinfo.profile"
+
+object InMemoryOAuthSessionStore {
+    @Volatile
+    var accessToken: String = ""
+    @Volatile
+    var userEmail: String = ""
+    @Volatile
+    var selectedGcpProjectId: String = ""
+
+    fun clear() {
+        accessToken = ""
+        userEmail = ""
+        selectedGcpProjectId = ""
+    }
+}
 
 fun attemptAutoSignIn(
     context: Context,
@@ -148,12 +166,21 @@ fun signOutUser(
 
 fun requestGcpOAuthAuthorization(
     activity: Activity,
+    includeUserInfoScopes: Boolean = false,
     onAccessToken: (String) -> Unit,
     onResolutionRequired: (IntentSenderRequest) -> Unit,
     onError: (String) -> Unit
 ) {
+    val scopes = buildList {
+        add(Scope(GCP_CLOUD_PLATFORM_SCOPE))
+        if (includeUserInfoScopes) {
+            add(Scope(SCOPE_OPENID))
+            add(Scope(SCOPE_EMAIL))
+            add(Scope(SCOPE_PROFILE))
+        }
+    }
     val authRequest = AuthorizationRequest.builder()
-        .setRequestedScopes(listOf(Scope(GCP_CLOUD_PLATFORM_SCOPE)))
+        .setRequestedScopes(scopes)
         .build()
 
     Identity.getAuthorizationClient(activity)

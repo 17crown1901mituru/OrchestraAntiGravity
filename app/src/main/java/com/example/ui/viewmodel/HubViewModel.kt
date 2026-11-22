@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.auth.InMemoryOAuthSessionStore
 import com.example.data.BridgeCallResult
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
@@ -249,8 +250,13 @@ class HubViewModel(
 
     private val _gcpWizardState = MutableStateFlow(
         GcpWizardState(
-            selectedProjectId = _credentials.value.gcpProjectId,
-            signingDiagnostics = runCatching { AppSignatureHelper.readDiagnostics(applicationContext) }.getOrNull()
+            accessToken = InMemoryOAuthSessionStore.accessToken,
+            oauthAuthorized = InMemoryOAuthSessionStore.accessToken.isNotBlank(),
+            selectedProjectId = InMemoryOAuthSessionStore.selectedGcpProjectId.ifBlank { _credentials.value.gcpProjectId },
+            signingDiagnostics = runCatching { AppSignatureHelper.readDiagnostics(applicationContext) }.getOrNull(),
+            statusMessage = if (InMemoryOAuthSessionStore.accessToken.isNotBlank()) {
+                "ログイン時の Google OAuth (cloud-platform) を引き継ぎました"
+            } else null
         )
     )
     val gcpWizardState: StateFlow<GcpWizardState> = _gcpWizardState.asStateFlow()
@@ -302,6 +308,9 @@ class HubViewModel(
             } else if (snap.termuxSyncedAtEpochMs == 0L) {
                 BackgroundSyncScheduler.triggerImmediateTermuxSync(applicationContext, currentUserId)
             }
+        }
+        if (InMemoryOAuthSessionStore.accessToken.isNotBlank()) {
+            loadGcpProjectsAndBilling()
         }
     }
 
@@ -1139,6 +1148,7 @@ class HubViewModel(
     }
 
     fun onUserSignedOut() {
+        InMemoryOAuthSessionStore.clear()
         BackgroundSyncScheduler.cancelUserSync(applicationContext, currentUserId)
     }
 

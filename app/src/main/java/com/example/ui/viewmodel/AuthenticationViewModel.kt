@@ -9,11 +9,14 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.auth.InMemoryOAuthSessionStore
 import com.example.auth.resolveDefaultWebClientId
 import com.example.auth.validateWebClientId
 import com.example.data.CloudBridgeClient
-import com.example.data.RuntimeCloudBootstrapConfig
+import com.example.data.GcpProjectSummary
+import com.example.data.GcpProvisioningClient
 import com.example.data.RuntimeCloudBootstrapStore
+import com.example.security.AppSignatureHelper
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -34,17 +37,25 @@ import kotlinx.coroutines.tasks.await
 
 private const val TAG = "AuthenticationViewModel"
 
+enum class LoginStage {
+    GOOGLE_OAUTH,
+    SELECT_GCP_PROJECT
+}
+
 data class AuthenticationUiState(
+    val loginStage: LoginStage = LoginStage.GOOGLE_OAUTH,
     val isLoading: Boolean = false,
     val isFirebaseReady: Boolean = false,
     val configuredWebClientId: String? = null,
     val isWebClientIdValid: Boolean = false,
     val webClientIdStatusLabel: String = "検証中...",
     val gatewayUrl: String = "https://gc2223.com",
+    val oauthAccessToken: String = "",
+    val oauthUserEmail: String = "",
+    val gcpProjects: List<GcpProjectSummary> = emptyList(),
+    val selectedGcpProjectId: String = "",
+    val statusMessage: String? = null,
     val errorMessage: String? = null,
-    val showBootstrapDialog: Boolean = false,
-    val bootstrapNotice: String? = null,
-    val pendingSignInAfterBootstrap: Boolean = false,
     val authenticatedUid: String? = null,
     val authenticatedEmail: String? = null
 )
@@ -52,7 +63,8 @@ data class AuthenticationUiState(
 class AuthenticationViewModel(
     appContext: Context,
     private val bootstrapStore: RuntimeCloudBootstrapStore = RuntimeCloudBootstrapStore(appContext.applicationContext),
-    private val bridgeClient: CloudBridgeClient = CloudBridgeClient()
+    private val bridgeClient: CloudBridgeClient = CloudBridgeClient(),
+    private val gcpClient: GcpProvisioningClient = GcpProvisioningClient()
 ) : ViewModel() {
 
     private val applicationContext = appContext.applicationContext
@@ -76,20 +88,29 @@ class AuthenticationViewModel(
 
         val statusLabel = when {
             firebaseReady && validatedClientId != null ->
-                "Web Client ID 検証済み (${validatedClientId.take(14)}...)"
+                "Firebase & Web Client ID 準備完了 (${validatedClientId.take(14)}...)"
             firebaseReady && validatedClientId == null ->
-                "Web Client ID 未検証 (*.apps.googleusercontent.com が必要)"
+                "Web Client ID 未取得 (Stage 2 の GCP 選択で自動取得)"
             else ->
-                "ゼロ埋め込みモード (ログイン時に自動取得または google-services.json 読込)"
+                "ゼロ埋め込みモード (1. Google OAuth → 2. GCP プロジェクト選択で自動構成)"
         }
 
         _uiState.update { state ->
+            val sessionToken = InMemoryOAuthSessionStore.accessToken
+            val effectiveToken = state.oauthAccessToken.ifBlank { sessionToken }
+            val effectiveEmail = state.oauthUserEmail.ifBlank { InMemoryOAuthSessionStore.userEmail }
+            val effectiveProject = state.selectedGcpProjectId.ifBlank {
+                InMemoryOAuthSessionStore.selectedGcpProjectId.ifBlank { bootstrap.firebaseProjectId }
+            }
             state.copy(
                 isFirebaseReady = firebaseReady,
                 configuredWebClientId = validatedClientId,
                 isWebClientIdValid = validatedClientId != null,
                 webClientIdStatusLabel = statusLabel,
                 gatewayUrl = bootstrap.gatewayUrl.ifBlank { "https://gc2223.com" },
+                oauthAccessToken = effectiveToken,
+                oauthUserEmail = effectiveEmail,
+                selectedGcpProjectId = effectiveProject,
                 authenticatedUid = user?.uid,
                 authenticatedEmail = user?.email
             )
@@ -111,15 +132,17 @@ class AuthenticationViewModel(
             if (current.isFirebaseReady && current.isWebClientIdValid) {
                 attemptSilentSignInInternal(credentialManager, onAuthSuccess)
             } else {
-                // Silently probe Gateway /v1/client-config without surfacing startup error banners
+                // Silently probe Gateway /v1/client-config; if unconfigured/404, stay cleanly at Stage 1 with Firebase uninitialized
                 val targetGateway = current.gatewayUrl.ifBlank { "https://gc2223.com" }
                 bridgeClient.fetchClientBootstrapConfig(targetGateway).onSuccess { cfg ->
-                    bootstrapStore.save(cfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
-                    if (RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)) {
-                        onFirebaseInitialized()
-                        refreshConfigurationState()
-                        if (_uiState.value.isWebClientIdValid) {
-                            attemptSilentSignInInternal(credentialManager, onAuthSuccess)
+                    if (cfg.hasFirebaseRuntimeParams()) {
+                        bootstrapStore.save(cfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
+                        if (RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)) {
+                            onFirebaseInitialized()
+                            refreshConfigurationState()
+                            if (_uiState.value.isWebClientIdValid) {
+                                attemptSilentSignInInternal(credentialManager, onAuthSuccess)
+                            }
                         }
                     }
                 }
@@ -168,7 +191,8 @@ class AuthenticationViewModel(
         activity: Activity?,
         credentialManager: CredentialManager,
         onFirebaseInitialized: () -> Unit,
-        onAuthSuccess: () -> Unit
+        onAuthSuccess: () -> Unit,
+        onLaunchStage1OAuth: () -> Unit
     ) {
         if (_uiState.value.isLoading) return
         refreshConfigurationState()
@@ -184,13 +208,354 @@ class AuthenticationViewModel(
             return
         }
 
-        // Zero-config runtime APK: attempt Gateway /v1/client-config first, then open bootstrap sheet if needed
-        _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+        // Clean runtime APK: probe Gateway /v1/client-config quietly; otherwise proceed straight to Stage 1 Google OAuth (never prompt for .json)
+        _uiState.update {
+            it.copy(
+                isLoading = true,
+                errorMessage = null,
+                statusMessage = "接続設定を確認中..."
+            )
+        }
         viewModelScope.launch {
             val targetGateway = _uiState.value.gatewayUrl.ifBlank { "https://gc2223.com" }
             val cfgResult = bridgeClient.fetchClientBootstrapConfig(targetGateway)
-            cfgResult.onSuccess { cfg ->
-                bootstrapStore.save(cfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
+            val resolvedCfg = cfgResult.getOrNull()
+            if (resolvedCfg != null && resolvedCfg.hasFirebaseRuntimeParams()) {
+                bootstrapStore.save(resolvedCfg.copy(gatewayUrl = targetGateway.trimEnd('/')))
+                val initialized = RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)
+                refreshConfigurationState()
+                val validId = _uiState.value.configuredWebClientId
+                if (initialized && validId != null) {
+                    onFirebaseInitialized()
+                    executeCredentialManagerSignIn(
+                        activity = activity,
+                        credentialManager = credentialManager,
+                        validatedClientId = validId,
+                        onAuthSuccess = onAuthSuccess
+                    )
+                    return@launch
+                }
+            }
+
+            // Transition immediately into Stage 1 Google OAuth authorization
+            _uiState.update {
+                it.copy(
+                    isLoading = false,
+                    errorMessage = null,
+                    statusMessage = "Google アカウントの OAuth 認証を開始しています..."
+                )
+            }
+            onLaunchStage1OAuth()
+        }
+    }
+
+    fun onStage1OAuthTokenAcquired(accessToken: String) {
+        val cleanToken = accessToken.trim()
+        if (cleanToken.isBlank()) {
+            onStage1OAuthFailed("Google OAuth Access Token が空でした")
+            return
+        }
+        InMemoryOAuthSessionStore.accessToken = cleanToken
+        _uiState.update {
+            it.copy(
+                isLoading = true,
+                oauthAccessToken = cleanToken,
+                errorMessage = null,
+                statusMessage = "Google アカウント情報と GCP プロジェクト一覧を取得中..."
+            )
+        }
+        viewModelScope.launch {
+            val userInfoRes = gcpClient.fetchGoogleUserInfo(cleanToken)
+            val resolvedEmail = userInfoRes.getOrNull()?.email.orEmpty()
+            if (resolvedEmail.isNotBlank()) {
+                InMemoryOAuthSessionStore.userEmail = resolvedEmail
+            }
+
+            val projectsRes = gcpClient.listProjects(cleanToken)
+            val projects = projectsRes.getOrDefault(emptyList())
+            val previousSelected = _uiState.value.selectedGcpProjectId.ifBlank {
+                InMemoryOAuthSessionStore.selectedGcpProjectId
+            }
+            val selectedId = when {
+                projects.any { it.projectId == previousSelected } -> previousSelected
+                projects.isNotEmpty() -> projects.first().projectId
+                else -> previousSelected
+            }
+            if (selectedId.isNotBlank()) {
+                InMemoryOAuthSessionStore.selectedGcpProjectId = selectedId
+            }
+
+            val errMessage = projectsRes.exceptionOrNull()?.localizedMessage
+            _uiState.update {
+                it.copy(
+                    loginStage = LoginStage.SELECT_GCP_PROJECT,
+                    isLoading = false,
+                    oauthAccessToken = cleanToken,
+                    oauthUserEmail = resolvedEmail.ifBlank { it.oauthUserEmail },
+                    gcpProjects = projects,
+                    selectedGcpProjectId = selectedId,
+                    statusMessage = if (projectsRes.isSuccess) {
+                        "Google 認証完了 (${projects.size} 件の GCP プロジェクトを検出)"
+                    } else null,
+                    errorMessage = errMessage
+                )
+            }
+        }
+    }
+
+    fun onStage1OAuthFailed(message: String) {
+        _uiState.update {
+            it.copy(
+                isLoading = false,
+                statusMessage = null,
+                errorMessage = message
+            )
+        }
+    }
+
+    fun backToStage1OAuth() {
+        _uiState.update {
+            it.copy(
+                loginStage = LoginStage.GOOGLE_OAUTH,
+                isLoading = false,
+                statusMessage = null,
+                errorMessage = null
+            )
+        }
+    }
+
+    fun refreshStage2Projects() {
+        val token = _uiState.value.oauthAccessToken
+        if (token.isBlank()) {
+            onStage1OAuthFailed("先に Google OAuth 認証を完了してください")
+            return
+        }
+        _uiState.update { it.copy(isLoading = true, errorMessage = null, statusMessage = "GCP プロジェクト一覧を再取得中...") }
+        viewModelScope.launch {
+            val res = gcpClient.listProjects(token)
+            res.onSuccess { projects ->
+                val current = _uiState.value.selectedGcpProjectId
+                val resolved = when {
+                    projects.any { it.projectId == current } -> current
+                    projects.isNotEmpty() -> projects.first().projectId
+                    else -> current
+                }
+                if (resolved.isNotBlank()) InMemoryOAuthSessionStore.selectedGcpProjectId = resolved
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        gcpProjects = projects,
+                        selectedGcpProjectId = resolved,
+                        statusMessage = "${projects.size} 件の GCP プロジェクトを取得しました",
+                        errorMessage = null
+                    )
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = null,
+                        errorMessage = err.localizedMessage ?: "GCP プロジェクト一覧の再取得に失敗しました"
+                    )
+                }
+            }
+        }
+    }
+
+    fun selectStage2Project(projectId: String) {
+        val cleanId = projectId.trim()
+        if (cleanId.isBlank()) return
+        InMemoryOAuthSessionStore.selectedGcpProjectId = cleanId
+        _uiState.update {
+            it.copy(
+                selectedGcpProjectId = cleanId,
+                errorMessage = null,
+                statusMessage = "選択中プロジェクト: $cleanId"
+            )
+        }
+    }
+
+    fun createStage2ProjectAndSelect(projectId: String, displayName: String) {
+        val token = _uiState.value.oauthAccessToken
+        if (token.isBlank()) {
+            onStage1OAuthFailed("先に Google OAuth 認証を完了してください")
+            return
+        }
+        _uiState.update {
+            it.copy(
+                isLoading = true,
+                errorMessage = null,
+                statusMessage = "新規 GCP プロジェクト '${projectId.trim().lowercase()}' を作成中..."
+            )
+        }
+        viewModelScope.launch {
+            gcpClient.createProject(token, projectId, displayName)
+                .onSuccess { created ->
+                    InMemoryOAuthSessionStore.selectedGcpProjectId = created.projectId
+                    val updatedList = (_uiState.value.gcpProjects.filterNot { it.projectId == created.projectId } + created)
+                        .sortedBy { it.projectId }
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            gcpProjects = updatedList,
+                            selectedGcpProjectId = created.projectId,
+                            statusMessage = "GCP プロジェクト '${created.projectId}' を作成・選択しました",
+                            errorMessage = null
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = null,
+                            errorMessage = err.localizedMessage ?: "GCP プロジェクトの作成に失敗しました"
+                        )
+                    }
+                }
+        }
+    }
+
+    fun provisionSelectedProjectAndSignIn(
+        activity: Activity?,
+        credentialManager: CredentialManager,
+        onFirebaseInitialized: () -> Unit,
+        onAuthSuccess: () -> Unit
+    ) {
+        val current = _uiState.value
+        val token = current.oauthAccessToken.trim()
+        val projectId = current.selectedGcpProjectId.trim()
+        if (token.isBlank()) {
+            _uiState.update { it.copy(errorMessage = "Google OAuth トークンがありません。Stage 1 からやり直してください。") }
+            return
+        }
+        if (projectId.isBlank()) {
+            _uiState.update { it.copy(errorMessage = "GCP プロジェクトを選択または作成してください。") }
+            return
+        }
+
+        _uiState.update {
+            it.copy(
+                isLoading = true,
+                errorMessage = null,
+                statusMessage = "必須 Google Cloud API (Firebase / Firestore / Auth) を承認・有効化中..."
+            )
+        }
+
+        viewModelScope.launch {
+            val coreServices = listOf(
+                "firebase.googleapis.com",
+                "firestore.googleapis.com",
+                "identitytoolkit.googleapis.com",
+                "firebaseappcheck.googleapis.com",
+                "cloudresourcemanager.googleapis.com",
+                "serviceusage.googleapis.com"
+            )
+            gcpClient.batchEnableServices(token, projectId, coreServices)
+                .onFailure { err ->
+                    Log.w(TAG, "Best-effort batchEnableServices notice for $projectId: ${err.message}")
+                }
+
+            _uiState.update {
+                it.copy(statusMessage = "Firebase Management API から設定・署名 SHA・Web Client ID を自動取得中...")
+            }
+
+            val diag = runCatching { AppSignatureHelper.readDiagnostics(applicationContext) }.getOrNull()
+            val syncResult = gcpClient.ensureFirebaseAndFetchAndroidConfig(
+                accessToken = token,
+                projectId = projectId,
+                packageName = applicationContext.packageName,
+                existingGatewayUrl = current.gatewayUrl,
+                sha1 = diag?.sha1.orEmpty(),
+                sha256 = diag?.sha256.orEmpty()
+            )
+
+            syncResult.onFailure { err ->
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = null,
+                        errorMessage = err.localizedMessage ?: "Firebase Management API からの設定取得に失敗しました"
+                    )
+                }
+                return@launch
+            }
+
+            val synced = syncResult.getOrThrow()
+            val existingCfg = bootstrapStore.load()
+            val mergedCfg = synced.bootstrapConfig.copy(
+                gatewayUrl = current.gatewayUrl.trim().trimEnd('/').ifBlank { existingCfg.gatewayUrl },
+                defaultGithubRepo = existingCfg.defaultGithubRepo.ifBlank { synced.bootstrapConfig.defaultGithubRepo }
+            )
+            bootstrapStore.save(mergedCfg)
+
+            InMemoryOAuthSessionStore.accessToken = token
+            InMemoryOAuthSessionStore.selectedGcpProjectId = projectId
+            if (current.oauthUserEmail.isNotBlank()) {
+                InMemoryOAuthSessionStore.userEmail = current.oauthUserEmail
+            }
+
+            val initialized = RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)
+            if (initialized) {
+                onFirebaseInitialized()
+            }
+            refreshConfigurationState()
+
+            val validClientId = _uiState.value.configuredWebClientId
+            if (initialized && validClientId != null) {
+                _uiState.update {
+                    it.copy(
+                        statusMessage = "Firebase 初期化完了 (${synced.androidAppId})。Google アカウントで認証を確定中..."
+                    )
+                }
+                executeCredentialManagerSignIn(
+                    activity = activity,
+                    credentialManager = credentialManager,
+                    validatedClientId = validClientId,
+                    onAuthSuccess = onAuthSuccess
+                )
+            } else {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = null,
+                        errorMessage = "Firebase 設定は保存されましたが Web Client ID (*.apps.googleusercontent.com) が未反映です。Google Auth プロバイダまたは OAuth 同意画面を確認してもう一度お試しください。"
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateGatewayUrl(url: String) {
+        val clean = url.trim().trimEnd('/')
+        val currentCfg = bootstrapStore.load()
+        bootstrapStore.save(currentCfg.copy(gatewayUrl = clean))
+        _uiState.update { it.copy(gatewayUrl = clean.ifBlank { "https://gc2223.com" }) }
+    }
+
+    fun connectGatewayFromAdvancedOptions(
+        gatewayUrl: String,
+        activity: Activity?,
+        credentialManager: CredentialManager,
+        onFirebaseInitialized: () -> Unit,
+        onAuthSuccess: () -> Unit
+    ) {
+        val target = gatewayUrl.trim().trimEnd('/').ifBlank { "https://gc2223.com" }
+        updateGatewayUrl(target)
+        _uiState.update { it.copy(isLoading = true, errorMessage = null, statusMessage = "$target/v1/client-config を取得中...") }
+        viewModelScope.launch {
+            bridgeClient.fetchClientBootstrapConfig(target).onSuccess { cfg ->
+                if (!cfg.hasFirebaseRuntimeParams()) {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = null,
+                            errorMessage = "Gateway に有効な Firebase 設定が返却されませんでした"
+                        )
+                    }
+                    return@onSuccess
+                }
+                bootstrapStore.save(cfg.copy(gatewayUrl = target))
                 val initialized = RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)
                 refreshConfigurationState()
                 val validId = _uiState.value.configuredWebClientId
@@ -206,25 +571,17 @@ class AuthenticationViewModel(
                     _uiState.update {
                         it.copy(
                             isLoading = false,
-                            bootstrapNotice = "Gateway から一部項目を取得しましたが有効な Web Client ID (*.apps.googleusercontent.com) が不足しています。google-services.json を選択または入力してください。",
-                            pendingSignInAfterBootstrap = true,
-                            showBootstrapDialog = true
+                            statusMessage = null,
+                            errorMessage = "Web Client ID (*.apps.googleusercontent.com) が Gateway 応答に含まれていません"
                         )
                     }
                 }
             }.onFailure { err ->
-                val rawMsg = err.localizedMessage.orEmpty()
-                val notice = if (rawMsg.contains("404")) {
-                    "この APK は秘密情報未埋め込みビルドで、Gateway ($targetGateway/v1/client-config) もまだ更新前 (404) です。端末内の google-services.json を選択するとすぐ Google ログインを開始できます。"
-                } else {
-                    "Gateway ($targetGateway) から自動設定を取得できなかったため、端末内の google-services.json を選択するか接続先を指定してください。"
-                }
                 _uiState.update {
                     it.copy(
                         isLoading = false,
-                        bootstrapNotice = notice,
-                        pendingSignInAfterBootstrap = true,
-                        showBootstrapDialog = true
+                        statusMessage = null,
+                        errorMessage = err.localizedMessage ?: "Gateway からの接続設定取得に失敗しました"
                     )
                 }
             }
@@ -241,6 +598,7 @@ class AuthenticationViewModel(
             _uiState.update {
                 it.copy(
                     isLoading = false,
+                    statusMessage = null,
                     errorMessage = "設定されている Web Client ID が無効です: $validatedClientId"
                 )
             }
@@ -249,7 +607,11 @@ class AuthenticationViewModel(
 
         if (activity == null) {
             _uiState.update {
-                it.copy(isLoading = false, errorMessage = "Google Sign-In には Activity コンテキストが必要です。")
+                it.copy(
+                    isLoading = false,
+                    statusMessage = null,
+                    errorMessage = "Google Sign-In には Activity コンテキストが必要です。"
+                )
             }
             return
         }
@@ -269,78 +631,31 @@ class AuthenticationViewModel(
                         ?: throw IllegalStateException("FirebaseAuth is not initialized.")
                     auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
                     refreshConfigurationState(auth)
-                    _uiState.update { it.copy(isLoading = false, errorMessage = null) }
+                    _uiState.update { it.copy(isLoading = false, errorMessage = null, statusMessage = null) }
                     onAuthSuccess()
                 } else {
                     _uiState.update {
-                        it.copy(isLoading = false, errorMessage = "想定外の認証情報タイプが返されました。")
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = null,
+                            errorMessage = "想定外の認証情報タイプが返されました。"
+                        )
                     }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: GetCredentialCancellationException) {
                 Log.w(TAG, "Google Sign-In cancelled or dismissed: ${e.message}", e)
-                _uiState.update { it.copy(isLoading = false) }
+                _uiState.update { it.copy(isLoading = false, statusMessage = null) }
             } catch (e: Exception) {
                 Log.e(TAG, "Google Sign-In failed", e)
                 _uiState.update {
                     it.copy(
                         isLoading = false,
+                        statusMessage = null,
                         errorMessage = e.localizedMessage ?: "Google ログインに失敗しました"
                     )
                 }
-            }
-        }
-    }
-
-    fun openBootstrapDialog() {
-        _uiState.update {
-            it.copy(
-                bootstrapNotice = null,
-                pendingSignInAfterBootstrap = false,
-                showBootstrapDialog = true
-            )
-        }
-    }
-
-    fun dismissBootstrapDialog() {
-        _uiState.update {
-            it.copy(
-                showBootstrapDialog = false,
-                pendingSignInAfterBootstrap = false
-            )
-        }
-    }
-
-    fun onBootstrapCompleted(
-        updatedConfig: RuntimeCloudBootstrapConfig,
-        activity: Activity?,
-        credentialManager: CredentialManager,
-        onFirebaseInitialized: () -> Unit,
-        onAuthSuccess: () -> Unit
-    ) {
-        val shouldContinueSignIn = _uiState.value.pendingSignInAfterBootstrap
-        _uiState.update {
-            it.copy(
-                gatewayUrl = updatedConfig.gatewayUrl.ifBlank { it.gatewayUrl },
-                showBootstrapDialog = false,
-                pendingSignInAfterBootstrap = false
-            )
-        }
-        onFirebaseInitialized()
-        refreshConfigurationState()
-
-        val validClientId = _uiState.value.configuredWebClientId
-        if (shouldContinueSignIn && _uiState.value.isFirebaseReady && validClientId != null) {
-            executeCredentialManagerSignIn(
-                activity = activity,
-                credentialManager = credentialManager,
-                validatedClientId = validClientId,
-                onAuthSuccess = onAuthSuccess
-            )
-        } else if (shouldContinueSignIn) {
-            _uiState.update {
-                it.copy(errorMessage = "有効な Web Client ID が未設定のため、ログインを開始できませんでした。")
             }
         }
     }

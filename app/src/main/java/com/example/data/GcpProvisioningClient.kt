@@ -42,6 +42,12 @@ data class FirebaseAndroidSyncResult(
     val registeredShaCount: Int = 0
 )
 
+data class GoogleUserInfo(
+    val email: String,
+    val name: String,
+    val sub: String
+)
+
 class GcpProvisioningClient(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -51,13 +57,39 @@ class GcpProvisioningClient(
     private val resourceManagerBaseUrl: String = "https://cloudresourcemanager.googleapis.com",
     private val serviceUsageBaseUrl: String = "https://serviceusage.googleapis.com",
     private val firebaseMgmtBaseUrl: String = "https://firebase.googleapis.com",
-    private val billingBaseUrl: String = "https://cloudbilling.googleapis.com"
+    private val billingBaseUrl: String = "https://cloudbilling.googleapis.com",
+    private val userInfoBaseUrl: String = "https://www.googleapis.com"
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
     private val cleanRmBase = resourceManagerBaseUrl.trimEnd('/')
     private val cleanSuBase = serviceUsageBaseUrl.trimEnd('/')
     private val cleanFbBase = firebaseMgmtBaseUrl.trimEnd('/')
     private val cleanBillBase = billingBaseUrl.trimEnd('/')
+    private val cleanUserInfoBase = userInfoBaseUrl.trimEnd('/')
+
+    suspend fun fetchGoogleUserInfo(accessToken: String): Result<GoogleUserInfo> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                require(accessToken.isNotBlank()) { "GCP OAuth Access Token が未取得です" }
+                val req = Request.Builder()
+                    .url("$cleanUserInfoBase/oauth2/v3/userinfo")
+                    .header("Authorization", "Bearer ${accessToken.trim()}")
+                    .get()
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException(parseGoogleApiError(raw, resp.code, "Google ユーザー情報取得"))
+                    }
+                    val json = JSONObject(raw)
+                    GoogleUserInfo(
+                        email = json.optString("email", "").trim(),
+                        name = json.optString("name", "").trim(),
+                        sub = json.optString("sub", "").trim()
+                    )
+                }
+            }
+        }
 
     suspend fun listProjects(accessToken: String): Result<List<GcpProjectSummary>> =
         withContext(Dispatchers.IO) {
@@ -428,32 +460,40 @@ class GcpProvisioningClient(
                 sha256 = sha256
             ).getOrDefault(0)
 
-            // 3. Download google-services.json config via Firebase Management API
+            // 3. Download google-services.json config via Firebase Management API (retry once if Web Client ID was still propagating)
             val cfgReq = Request.Builder()
                 .url("$cleanFbBase/v1beta1/projects/$cleanProject/androidApps/$matchedAppId/config")
                 .header("Authorization", "Bearer ${accessToken.trim()}")
                 .get()
                 .build()
-            val decodedJson = client.newCall(cfgReq).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseGoogleApiError(raw, resp.code, "google-services.json 取得"))
+            var decodedJson = ""
+            var parsedCfg: RuntimeCloudBootstrapConfig? = null
+            repeat(2) { attempt ->
+                decodedJson = client.newCall(cfgReq).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException(parseGoogleApiError(raw, resp.code, "google-services.json 取得"))
+                    }
+                    val b64 = JSONObject(raw).optString("configFileContents", "")
+                    require(b64.isNotBlank()) { "configFileContents が空でした" }
+                    String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8)
                 }
-                val b64 = JSONObject(raw).optString("configFileContents", "")
-                require(b64.isNotBlank()) { "configFileContents が空でした" }
-                String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8)
+                val cfg = RuntimeCloudBootstrapStore.parseGoogleServicesJson(
+                    rawJson = decodedJson,
+                    targetPackageName = packageName,
+                    existingGatewayUrl = existingGatewayUrl
+                ).getOrThrow()
+                parsedCfg = cfg
+                if (cfg.firebaseWebClientId.isNotBlank() || attempt == 1) {
+                    return@repeat
+                }
+                delay(800L)
             }
-
-            val parsedCfg = RuntimeCloudBootstrapStore.parseGoogleServicesJson(
-                rawJson = decodedJson,
-                targetPackageName = packageName,
-                existingGatewayUrl = existingGatewayUrl
-            ).getOrThrow()
 
             FirebaseAndroidSyncResult(
                 projectId = cleanProject,
                 androidAppId = matchedAppId,
-                bootstrapConfig = parsedCfg,
+                bootstrapConfig = checkNotNull(parsedCfg),
                 rawGoogleServicesJson = decodedJson,
                 registeredShaCount = shaCount
             )

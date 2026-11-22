@@ -3,12 +3,14 @@ package com.example
 import android.content.Context
 import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
+import com.example.auth.InMemoryOAuthSessionStore
 import com.example.auth.validateWebClientId
 import com.example.data.GcpProvisioningClient
 import com.example.data.RuntimeCloudBootstrapConfig
 import com.example.data.RuntimeCloudBootstrapStore
 import com.example.security.AppSignatureHelper
 import com.example.ui.viewmodel.AuthenticationViewModel
+import com.example.ui.viewmodel.LoginStage
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -43,7 +45,8 @@ class GcpWizardAndAuthTest {
     }
 
     @Test
-    fun `authentication viewmodel validates configured web client id and dialog transitions`() {
+    fun `authentication viewmodel validates configured web client id and stage transitions`() {
+        InMemoryOAuthSessionStore.clear()
         val context = ApplicationProvider.getApplicationContext<Context>()
         val store = RuntimeCloudBootstrapStore(context)
         store.clear()
@@ -62,15 +65,19 @@ class GcpWizardAndAuthTest {
         vm.refreshConfigurationState()
 
         val state = vm.uiState.value
+        assertEquals(LoginStage.GOOGLE_OAUTH, state.loginStage)
         assertEquals("https://gc2223.com", state.gatewayUrl)
         assertTrue(state.isWebClientIdValid)
         assertEquals("9876543210-validclient.apps.googleusercontent.com", state.configuredWebClientId)
 
-        vm.openBootstrapDialog()
-        assertTrue(vm.uiState.value.showBootstrapDialog)
-        vm.dismissBootstrapDialog()
-        assertFalse(vm.uiState.value.showBootstrapDialog)
+        vm.selectStage2Project("ag-selected-proj")
+        assertEquals("ag-selected-proj", vm.uiState.value.selectedGcpProjectId)
+        assertEquals("ag-selected-proj", InMemoryOAuthSessionStore.selectedGcpProjectId)
 
+        vm.backToStage1OAuth()
+        assertEquals(LoginStage.GOOGLE_OAUTH, vm.uiState.value.loginStage)
+
+        InMemoryOAuthSessionStore.clear()
         store.clear()
     }
 
@@ -116,7 +123,7 @@ class GcpWizardAndAuthTest {
     }
 
     @Test
-    fun `gcp provisioning client creates projects enables apis registers sha and fetches firebase config`() = runTest {
+    fun `gcp provisioning client fetches userinfo creates projects enables apis registers sha and fetches firebase config`() = runTest {
         val ss = ServerSocket(0, 30, InetAddress.getByName("127.0.0.1"))
         val port = ss.localPort
         val capturedShaPosts = Collections.synchronizedList(mutableListOf<String>())
@@ -147,7 +154,7 @@ class GcpWizardAndAuthTest {
         val serverThread = Thread {
             runCatching {
                 ss.soTimeout = 5000
-                repeat(12) {
+                repeat(15) {
                     val sock = runCatching { ss.accept() }.getOrNull() ?: return@repeat
                     sock.use { s ->
                         val reader = s.getInputStream().bufferedReader()
@@ -167,6 +174,9 @@ class GcpWizardAndAuthTest {
                         } else ""
 
                         val respJson = when {
+                            reqLine.startsWith("GET /oauth2/v3/userinfo") -> """
+                                {"sub":"google-sub-123","email":"owner@gc2223.com","name":"Owner"}
+                            """.trimIndent()
                             reqLine.startsWith("GET /v1/projects?") -> """
                                 {"projects":[{"projectId":"existing-proj","name":"Existing Proj","projectNumber":"1001","lifecycleState":"ACTIVE"}]}
                             """.trimIndent()
@@ -214,8 +224,13 @@ class GcpWizardAndAuthTest {
                 resourceManagerBaseUrl = base,
                 serviceUsageBaseUrl = base,
                 firebaseMgmtBaseUrl = base,
-                billingBaseUrl = base
+                billingBaseUrl = base,
+                userInfoBaseUrl = base
             )
+
+            val userRes = client.fetchGoogleUserInfo("ya29.test-token")
+            assertTrue(userRes.isSuccess)
+            assertEquals("owner@gc2223.com", userRes.getOrThrow().email)
 
             val listRes = client.listProjects("ya29.test-token")
             assertTrue(listRes.isSuccess)
