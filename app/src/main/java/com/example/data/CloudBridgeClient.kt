@@ -1,6 +1,9 @@
 package com.example.data
 
 import android.util.Base64
+import com.example.auth.GoogleAccountSession
+import com.example.auth.InMemoryOAuthSessionStore
+import java.security.MessageDigest
 import com.example.model.CloudflareSyncStatus
 import com.example.model.CloudflareWorkerSummary
 import com.example.model.EmailRouteTarget
@@ -52,14 +55,94 @@ class CloudBridgeClient(
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
+    private fun deriveVirtualAliasFromJwt(token: String): String? {
+        return runCatching {
+            val parts = token.trim().split(".")
+            if (parts.size < 2) return@runCatching null
+            val payloadBytes = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            val sub = JSONObject(String(payloadBytes, Charsets.UTF_8)).optString("sub", "").trim()
+            if (sub.isBlank()) null else GoogleAccountSession.buildVirtualAlias(sub)
+        }.getOrNull()
+    }
+
     private fun Request.Builder.applyGatewayAuth(bearerToken: String, firebaseIdToken: String?): Request.Builder {
+        val session = InMemoryOAuthSessionStore.currentSession
+        val effectiveIdToken = firebaseIdToken?.trim().orEmpty().ifBlank { session?.idToken.orEmpty() }
+        val effectiveAlias = session?.virtualAlias.orEmpty()
+            .ifBlank { deriveVirtualAliasFromJwt(effectiveIdToken).orEmpty() }
+            .ifBlank { "u-anonymous000@gc2223.com" }
+
+        header("X-Virtual-Alias", effectiveAlias)
+        if (effectiveIdToken.isNotBlank()) {
+            header("X-Google-Id-Token", effectiveIdToken)
+            header("X-Firebase-Token", effectiveIdToken)
+        }
         if (bearerToken.isNotBlank()) {
             header("Authorization", "Bearer ${bearerToken.trim()}")
-        }
-        if (!firebaseIdToken.isNullOrBlank()) {
-            header("X-Firebase-Token", firebaseIdToken.trim())
+        } else if (effectiveIdToken.isNotBlank()) {
+            header("Authorization", "Bearer $effectiveIdToken")
         }
         return this
+    }
+
+    suspend fun callMcpTool(
+        baseUrl: String,
+        bearerToken: String = "",
+        firebaseIdToken: String? = null,
+        toolName: String,
+        arguments: JSONObject = JSONObject()
+    ): BridgeCallResult = withContext(Dispatchers.IO) {
+        val cleanBase = normalizeBaseUrl(baseUrl)
+        val rpcBody = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", "mcp-${System.currentTimeMillis()}")
+            put("method", "tools/call")
+            put("params", JSONObject().apply {
+                put("name", toolName)
+                put("arguments", arguments)
+            })
+        }.toString()
+
+        try {
+            val req = Request.Builder()
+                .url("$cleanBase/mcp")
+                .applyGatewayAuth(bearerToken, firebaseIdToken)
+                .post(rpcBody.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@withContext BridgeCallResult(false, resp.code, "MCP HTTP ${resp.code}: ${raw.take(240)}")
+                }
+                val root = runCatching { JSONObject(raw) }.getOrNull()
+                    ?: return@withContext BridgeCallResult(true, resp.code, raw)
+                val errObj = root.optJSONObject("error")
+                if (errObj != null) {
+                    return@withContext BridgeCallResult(
+                        false,
+                        resp.code,
+                        "MCP Error ${errObj.optInt("code", -32000)}: ${errObj.optString("message", raw)}"
+                    )
+                }
+                val result = root.optJSONObject("result") ?: root
+                val isError = result.optBoolean("isError", false)
+                val contentArr = result.optJSONArray("content")
+                val text = buildString {
+                    if (contentArr != null) {
+                        for (i in 0 until contentArr.length()) {
+                            val t = contentArr.optJSONObject(i)?.optString("text", "").orEmpty().trim()
+                            if (t.isNotBlank()) {
+                                if (isNotEmpty()) appendLine()
+                                append(t)
+                            }
+                        }
+                    }
+                }.ifBlank { result.toString(2) }
+                BridgeCallResult(!isError, resp.code, text)
+            }
+        } catch (e: Exception) {
+            BridgeCallResult(false, 0, e.localizedMessage ?: "MCP request failed")
+        }
     }
 
     suspend fun fetchClientBootstrapConfig(gatewayUrl: String): Result<RuntimeCloudBootstrapConfig> =
@@ -131,47 +214,18 @@ class CloudBridgeClient(
         bearerToken: String,
         prompt: String,
         firebaseIdToken: String? = null
-    ): BridgeCallResult = withContext(Dispatchers.IO) {
-        val cleanBase = normalizeBaseUrl(baseUrl)
-        val url = "$cleanBase/v1/chat"
-        try {
-            val payload = JSONObject().apply {
-                put("prompt", prompt)
-                put("client", "antigravity-android")
-            }.toString()
-
-            val builder = Request.Builder()
-                .url(url)
-                .post(payload.toRequestBody(jsonMediaType))
-            if (bearerToken.isNotBlank()) {
-                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
-            }
-            if (!firebaseIdToken.isNullOrBlank()) {
-                builder.header("X-Firebase-Token", firebaseIdToken)
-            }
-
-            client.newCall(builder.build()).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    return@withContext BridgeCallResult(
-                        success = false,
-                        statusCode = resp.code,
-                        message = "Gateway HTTP ${resp.code}: ${raw.take(300).ifBlank { resp.message }}"
-                    )
-                }
-                val parsedText = try {
-                    val json = JSONObject(raw)
-                    json.optString("reply").ifBlank {
-                        json.optString("response").ifBlank { raw }
-                    }
-                } catch (_: Exception) {
-                    raw
-                }
-                BridgeCallResult(true, resp.code, parsedText.ifBlank { "Empty response from gc2223.com" })
-            }
-        } catch (e: Exception) {
-            BridgeCallResult(false, 0, e.localizedMessage ?: "Request to gc2223.com failed")
+    ): BridgeCallResult {
+        val args = JSONObject().apply {
+            put("prompt", prompt)
+            put("maxLength", 8000)
         }
+        return callMcpTool(
+            baseUrl = baseUrl,
+            bearerToken = bearerToken,
+            firebaseIdToken = firebaseIdToken,
+            toolName = "mcp_sanitize_prompt",
+            arguments = args
+        )
     }
 
     suspend fun sendCostAlertWebhook(
@@ -651,84 +705,66 @@ class CloudBridgeClient(
         termuxPreset: TermuxPresetCommand = TermuxPresetCommand.GIT_PULL
     ): OrchestrationRunResult = withContext(Dispatchers.IO) {
         val cleanBase = normalizeBaseUrl(baseUrl)
-        val url = "$cleanBase/v1/orchestrate"
         val traceHex = java.util.UUID.randomUUID().toString().replace("-", "").lowercase()
         val spanHex = java.util.UUID.randomUUID().toString().replace("-", "").take(16).lowercase()
         val traceId = traceHex.take(12)
         val traceparent = "00-$traceHex-$spanHex-01"
-        try {
-            val innerPayload = JSONObject().apply {
-                put("prompt", promptOrInput.trim())
-                put("targetEnv", targetEnv.ifBlank { "dev" })
-                put("preset", termuxPreset.presetId)
-                if (promptOrInput.contains("http") || promptOrInput.contains(".")) {
-                    put("url", promptOrInput.trim())
+
+        val (mcpToolName, mcpArgs) = when {
+            taskType.taskId.contains("termux", ignoreCase = true) -> {
+                "termux_run_preset" to JSONObject().apply {
+                    put("preset", termuxPreset.presetId)
+                    if (promptOrInput.isNotBlank()) put("workdir", promptOrInput.trim())
                 }
             }
-            val payload = JSONObject().apply {
-                put("traceId", traceId)
-                put("traceparent", traceparent)
-                put("taskType", taskType.taskId)
-                put("routeAddress", routeTarget.address)
-                put("repo", ownerRepo.trim())
-                put("payload", innerPayload)
-            }.toString()
-
-            val builder = Request.Builder()
-                .url(url)
-                .header("traceparent", traceparent)
-                .post(payload.toRequestBody(jsonMediaType))
-            if (bearerToken.isNotBlank()) {
-                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
-            }
-            if (!firebaseIdToken.isNullOrBlank()) {
-                builder.header("X-Firebase-Token", firebaseIdToken)
-            }
-
-            client.newCall(builder.build()).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                val json = runCatching { JSONObject(raw) }.getOrNull()
-                val ok = resp.isSuccessful && (json?.optBoolean("ok", true) == true)
-                val returnedTraceId = json?.optString("traceId").orEmpty().ifBlank { traceId }
-                val returnedTraceparent = json?.optString("traceparent").orEmpty().ifBlank { traceparent }
-                val confidence = if (json != null && json.has("confidence") && !json.isNull("confidence")) {
-                    json.optDouble("confidence")
-                } else null
-                val reasoning = json?.optString("reasoning").orEmpty()
-                val detail = json?.optString("detail").orEmpty().ifBlank { raw.take(600) }
-                val summary = if (ok) {
-                    "${routeTarget.address} -> ${taskType.label} 実行完了 (HTTP ${resp.code})"
-                } else {
-                    val hint = if (resp.code == 404) {
-                        "（Deploy Kit から worker/src/worker.js を Push・デプロイしてください）"
-                    } else ""
-                    "オーケストレーション HTTP ${resp.code}: ${detail.take(160)}$hint"
+            taskType.taskId.contains("github", ignoreCase = true) ||
+            taskType.taskId.contains("deploy", ignoreCase = true) ||
+            taskType.taskId.contains("terraform", ignoreCase = true) -> {
+                "github_relay_dispatch_workflow" to JSONObject().apply {
+                    put("repo", ownerRepo.trim())
+                    put("workflow", "antigravity-deploy.yml")
+                    put("ref", "main")
                 }
-                OrchestrationRunResult(
-                    success = ok,
-                    routeAddress = routeTarget.address,
-                    taskId = taskType.taskId,
-                    statusCode = resp.code,
-                    summary = summary,
-                    detail = detail,
-                    traceId = returnedTraceId,
-                    traceparent = returnedTraceparent,
-                    aiConfidence = confidence,
-                    aiReasoning = reasoning
-                )
             }
-        } catch (e: Exception) {
-            OrchestrationRunResult(
-                success = false,
-                routeAddress = routeTarget.address,
-                taskId = taskType.taskId,
-                statusCode = 0,
-                summary = e.localizedMessage ?: "オーケストレーション接続失敗",
-                detail = e.localizedMessage.orEmpty(),
-                traceId = traceId,
-                traceparent = traceparent
-            )
+            taskType.taskId.contains("gcp", ignoreCase = true) -> {
+                "gcp_discover_resources" to JSONObject().apply {
+                    put("projectId", targetEnv.ifBlank { "antigravity-513415" })
+                }
+            }
+            else -> {
+                "mcp_validate_payload" to JSONObject().apply {
+                    put("toolName", taskType.taskId)
+                    put("payload", JSONObject().apply {
+                        put("routeAddress", routeTarget.address)
+                        put("prompt", promptOrInput.trim())
+                        put("targetEnv", targetEnv.ifBlank { "dev" })
+                    })
+                }
+            }
         }
+
+        val mcpRes = callMcpTool(
+            baseUrl = cleanBase,
+            bearerToken = bearerToken,
+            firebaseIdToken = firebaseIdToken,
+            toolName = mcpToolName,
+            arguments = mcpArgs
+        )
+        val summary = if (mcpRes.success) {
+            "${routeTarget.address} -> MCP:$mcpToolName 実行完了 (HTTP ${mcpRes.statusCode})"
+        } else {
+            "MCPオーケストレーション HTTP ${mcpRes.statusCode}: ${mcpRes.message.take(160)}"
+        }
+        OrchestrationRunResult(
+            success = mcpRes.success,
+            routeAddress = routeTarget.address,
+            taskId = taskType.taskId,
+            statusCode = mcpRes.statusCode,
+            summary = summary,
+            detail = mcpRes.message,
+            traceId = traceId,
+            traceparent = traceparent
+        )
     }
 
     suspend fun fetchPendingTermuxQueueTask(
@@ -795,7 +831,18 @@ class CloudBridgeClient(
         val cleanGateway = normalizeBaseUrl(gatewayUrl)
         val encodedRepo = URLEncoder.encode(ownerRepo.trim(), "UTF-8")
         val encodedWf = URLEncoder.encode(workflowFile.trim(), "UTF-8")
-        val url = "$cleanGateway/v1/sso/status?repo=$encodedRepo&workflow=$encodedWf"
+        val mcpSession = callMcpTool(cleanGateway, bearerToken, firebaseIdToken, "mcp_inspect_session_context")
+        return@withContext GitHubSyncStatus(
+            health = if (mcpSession.success) SyncHealthState.PARTIAL else SyncHealthState.MISSING_CREDENTIALS,
+            targetRepo = ownerRepo,
+            summaryMessage = if (mcpSession.success) {
+                "Stateless MCP 認証済み（GitHub 操作は端末側 Device Flow / PAT で直接実行）"
+            } else {
+                "GitHub PAT 未設定（設定画面から Device Flow で連携してください）"
+            }
+        )
+        @Suppress("UNREACHABLE_CODE")
+        val url = "$cleanGateway/mcp"
         try {
             val req = Request.Builder()
                 .url(url)
@@ -908,8 +955,24 @@ class CloudBridgeClient(
             val hasSsoAuth = !firebaseIdToken.isNullOrBlank() || bearerToken.isNotBlank()
             if (hasSsoAuth && cleanGateway.isNotBlank()) {
                 val ssoStatus = runCatching {
+                    val mcpPing = callMcpTool(cleanGateway, bearerToken, firebaseIdToken, "mcp_inspect_session_context")
+                    if (mcpPing.success) {
+                        val parsed = runCatching { JSONObject(mcpPing.message) }.getOrNull()
+                        val alias = parsed?.optString("virtualAlias", "").orEmpty()
+                        val authLv = parsed?.optString("authLevel", "stateless").orEmpty()
+                        return@withContext CloudflareSyncStatus(
+                            health = SyncHealthState.CONNECTED,
+                            tokenStatus = authLv,
+                            accountName = alias,
+                            gatewayUrl = cleanGateway,
+                            gatewayHttpCode = mcpPing.statusCode,
+                            gatewayLatencyMs = latencyMs,
+                            gatewayHealthMessage = gatewayResult.message,
+                            summaryMessage = "Stateless MCP 稼働中 (${latencyMs}ms) • $alias ($authLv)"
+                        )
+                    }
                     val req = Request.Builder()
-                        .url("$cleanGateway/v1/sso/status")
+                        .url("$cleanGateway/health")
                         .applyGatewayAuth(bearerToken, firebaseIdToken)
                         .get()
                         .build()
