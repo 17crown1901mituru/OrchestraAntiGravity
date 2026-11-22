@@ -113,7 +113,9 @@ fun LoginScreen(
                     authViewModel.onStage1OAuthFailed(err.localizedMessage ?: "Google OAuth トークン取得に失敗しました")
                 }
         } else {
-            authViewModel.onStage1OAuthFailed("Google OAuth 承認がキャンセルされました")
+            authViewModel.onStage1OAuthFailed(
+                "Google OAuth 承認が中断されました（GCP Console 側の Android OAuth クライアント / SHA-1 未登録時は「ハブを開始」からそのまま MCP・Termux・GitHub 連携を利用できます）"
+            )
         }
     }
 
@@ -281,6 +283,26 @@ fun LoginScreen(
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                     )
                 }
+            }
+
+            OutlinedButton(
+                onClick = {
+                    authViewModel.enterHubInStatelessMode(
+                        accountHint = uiState.oauthUserEmail,
+                        onAuthSuccess = onAuthSuccess
+                    )
+                },
+                enabled = !uiState.isLoading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .testTag("enter_hub_stateless_button"),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    text = "ハブを開始 (GCP OAuth なしで続行)",
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
+                )
             }
 
             OutlinedButton(

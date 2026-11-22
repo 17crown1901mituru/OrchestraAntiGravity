@@ -47,10 +47,11 @@ data class GoogleAccountSession(
     val virtualAlias: String,
     val accessToken: String = "",
     val email: String = "",
-    val idToken: String = ""
+    val idToken: String = "",
+    val isStatelessLocal: Boolean = false
 ) {
     val isValid: Boolean
-        get() = sub.isNotBlank() && (accessToken.isNotBlank() || idToken.isNotBlank())
+        get() = sub.isNotBlank() && (isStatelessLocal || accessToken.isNotBlank() || idToken.isNotBlank())
 
     companion object {
         fun buildVirtualAlias(sub: String): String {

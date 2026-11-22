@@ -282,6 +282,36 @@ class AuthenticationViewModel(
         }
     }
 
+    fun enterHubInStatelessMode(
+        accountHint: String = "",
+        onAuthSuccess: () -> Unit
+    ) {
+        val seed = accountHint.trim().ifBlank {
+            "${applicationContext.packageName}:${android.os.Build.MODEL}"
+        }
+        val sub = GoogleAccountSession.deriveFallbackSub(seed)
+        val session = GoogleAccountSession(
+            sub = sub,
+            virtualAlias = GoogleAccountSession.buildVirtualAlias(sub),
+            accessToken = "",
+            email = accountHint.trim(),
+            idToken = "",
+            isStatelessLocal = true
+        )
+        InMemoryOAuthSessionStore.setSession(session)
+        refreshConfigurationState()
+        _uiState.update {
+            it.copy(
+                isLoading = false,
+                errorMessage = null,
+                authenticatedUid = session.sub,
+                authenticatedEmail = session.virtualAlias,
+                statusMessage = "ステートレスセッション開始 (${session.virtualAlias})"
+            )
+        }
+        onAuthSuccess()
+    }
+
     fun onStage1OAuthFailed(message: String) {
         _uiState.update {
             it.copy(
