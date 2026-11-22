@@ -3,13 +3,21 @@ package com.example
 import android.content.Context
 import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
+import com.example.auth.GoogleAccountSession
 import com.example.auth.InMemoryOAuthSessionStore
+import com.example.auth.extractGoogleJwtClaims
 import com.example.auth.validateWebClientId
+import com.example.data.CloudBridgeClient
 import com.example.data.GcpProvisioningClient
+import com.example.data.LocalSecretsStore
 import com.example.data.RuntimeCloudBootstrapConfig
 import com.example.data.RuntimeCloudBootstrapStore
+import com.example.data.SyncSnapshotStore
+import com.example.model.InferenceTarget
+import com.example.model.StreamUiState
 import com.example.security.AppSignatureHelper
 import com.example.ui.viewmodel.AuthenticationViewModel
+import com.example.ui.viewmodel.HubViewModel
 import com.example.ui.viewmodel.LoginStage
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -270,5 +278,33 @@ class GcpWizardAndAuthTest {
             runCatching { ss.close() }
             runCatching { serverThread.join(1000) }
         }
+    }
+
+    @Test
+    fun `hub viewmodel boots with optional null repository and jwt sub extraction without firebase`() {
+        val header = Base64.encodeToString("""{"alg":"RS256"}""".toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        val payload = Base64.encodeToString("""{"sub":"112233445566","email":"dev@example.com"}""".toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        val claims = extractGoogleJwtClaims("$header.$payload.sig")
+        assertEquals("112233445566" to "dev@example.com", claims)
+
+        val session = GoogleAccountSession.create(sub = claims!!.first, idToken = "$header.$payload.sig")
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = HubViewModel(
+            appContext = context,
+            repository = null,
+            secretsStore = LocalSecretsStore(context),
+            syncSnapshotStore = SyncSnapshotStore(context),
+            bridgeClient = CloudBridgeClient(),
+            currentUserId = session.sub,
+            userEmail = session.virtualAlias
+        )
+
+        val nodes = vm.nodesState.value
+        assertTrue(nodes is StreamUiState.Success)
+        assertEquals(4, (nodes as StreamUiState.Success).data.size)
+        assertEquals(InferenceTarget.GC2223_GATEWAY, vm.inferenceTarget.value)
+        assertFalse(vm.gcpWizardState.value.firebaseSynced)
+        assertEquals(session.sub, vm.vaultMetadata.value.linkedUid)
+        assertEquals(session.virtualAlias, vm.vaultMetadata.value.linkedEmail)
     }
 }

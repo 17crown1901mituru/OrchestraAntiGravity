@@ -66,8 +66,22 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import android.content.Intent
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Code
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Extension
+import androidx.compose.material.icons.rounded.OpenInBrowser
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material3.FilterChip
 import com.example.auth.extractGcpAccessTokenFromIntent
 import com.example.auth.requestGcpOAuthAuthorization
+import com.example.connectors.ConnectorStatus
+import com.example.connectors.GitHubDeviceCodeChallenge
+import com.example.connectors.GitHubOrganizationSummary
+import com.example.connectors.McpToolDefinition
+import com.example.connectors.McpToolExecutionResult
 import com.example.model.ExternalCredentials
 import com.example.model.GcpWizardState
 import kotlinx.coroutines.Dispatchers
@@ -79,16 +93,33 @@ fun WorkflowSetupWizardScreen(
     userEmail: String,
     wizardState: GcpWizardState,
     credentials: ExternalCredentials,
+    connectorStatuses: List<ConnectorStatus> = emptyList(),
+    mcpTools: List<McpToolDefinition> = emptyList(),
+    gitHubDeviceChallenge: GitHubDeviceCodeChallenge? = null,
+    gitHubOrganizations: List<GitHubOrganizationSummary> = emptyList(),
+    gitHubDiscoveredRepos: List<String> = emptyList(),
+    lastMcpToolResult: McpToolExecutionResult? = null,
     onOAuthTokenAcquired: (String) -> Unit,
     onOAuthError: (String) -> Unit,
     onLoadProjects: () -> Unit,
+    onSelectOrganization: (String) -> Unit = {},
     onSelectProject: (String) -> Unit,
+    onSelectGeminiModel: (String) -> Unit = {},
     onCreateProject: (projectId: String, displayName: String) -> Unit,
     onLinkBillingAccount: (String) -> Unit,
     onToggleApiSelection: (String) -> Unit,
     onRefreshApis: () -> Unit,
     onEnableSelectedApis: () -> Unit,
     onSyncFirebase: () -> Unit,
+    onStartGitHubDeviceFlow: (clientId: String) -> Unit = {},
+    onCompleteGitHubDeviceFlow: () -> Unit = {},
+    onSelectGitHubOrg: (String) -> Unit = {},
+    onSelectGitHubRepo: (String) -> Unit = {},
+    onAddCustomMcpEndpoint: (label: String, url: String, bearerToken: String) -> Unit = { _, _, _ -> },
+    onSwitchMcpEndpoint: (endpointId: String) -> Unit = {},
+    onRemoveMcpEndpoint: (endpointId: String) -> Unit = {},
+    onRefreshConnectors: () -> Unit = {},
+    onExecuteMcpTool: (toolName: String) -> Unit = {},
     onExportPortableBackupJson: () -> String,
     onApplyAllWorkflows: (gatewayUrl: String, githubOwnerRepo: String, termuxAgentUrl: String) -> Unit,
     onVerifyCloudflareGateway: (String) -> Unit,
@@ -116,6 +147,12 @@ fun WorkflowSetupWizardScreen(
     var termuxUrlInput by rememberSaveable(credentials.termuxAgentUrl) {
         mutableStateOf(credentials.termuxAgentUrl.ifBlank { "http://127.0.0.1:8765" })
     }
+    var githubClientIdInput by rememberSaveable(credentials.githubOAuthClientId) {
+        mutableStateOf(credentials.githubOAuthClientId)
+    }
+    var customMcpLabel by rememberSaveable { mutableStateOf("") }
+    var customMcpUrl by rememberSaveable { mutableStateOf("") }
+    var customMcpBearer by rememberSaveable { mutableStateOf("") }
 
     val oauthResolutionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
@@ -351,7 +388,7 @@ fun WorkflowSetupWizardScreen(
                     ) {
                         Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("一覧を取得")
+                        Text("自動ディスカバリー")
                     }
                     OutlinedButton(
                         onClick = { showCreateProjectForm = !showCreateProjectForm },
@@ -364,9 +401,42 @@ fun WorkflowSetupWizardScreen(
                     }
                 }
 
-                if (wizardState.projects.isNotEmpty()) {
+                if (wizardState.organizations.isNotEmpty()) {
+                    Text("GCP 組織 (Organization) フィルタ:", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = wizardState.selectedOrganizationId.isBlank(),
+                            onClick = { onSelectOrganization("") },
+                            label = { Text("すべて (${wizardState.projects.size})") }
+                        )
+                        wizardState.organizations.forEach { org ->
+                            FilterChip(
+                                selected = wizardState.selectedOrganizationId == org.orgId,
+                                onClick = { onSelectOrganization(org.orgId) },
+                                label = { Text(org.displayName) }
+                            )
+                        }
+                    }
+                }
+
+                val visibleProjects = remember(wizardState.projects, wizardState.selectedOrganizationId) {
+                    if (wizardState.selectedOrganizationId.isBlank()) {
+                        wizardState.projects
+                    } else {
+                        wizardState.projects.filter {
+                            it.parentType == "organization" && it.parentId == wizardState.selectedOrganizationId
+                        }
+                    }
+                }
+
+                if (visibleProjects.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        wizardState.projects.forEach { proj ->
+                        visibleProjects.forEach { proj ->
                             val selected = proj.projectId == wizardState.selectedProjectId
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
@@ -392,7 +462,11 @@ fun WorkflowSetupWizardScreen(
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(proj.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                        Text(proj.projectId, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                        Text(
+                                            text = if (proj.parentId.isNotBlank()) "${proj.projectId} (${proj.parentType}:${proj.parentId})" else proj.projectId,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
                                     }
                                 }
                             }
@@ -404,6 +478,28 @@ fun WorkflowSetupWizardScreen(
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.primary
                     )
+                }
+
+                if (wizardState.geminiModels.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("検出済み Gemini モデル:", style = MaterialTheme.typography.labelMedium)
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        wizardState.geminiModels.forEach { model ->
+                            FilterChip(
+                                selected = wizardState.selectedGeminiModel == model.modelId,
+                                onClick = { onSelectGeminiModel(model.modelId) },
+                                label = { Text(model.modelId) }
+                            )
+                        }
+                    }
                 }
 
                 AnimatedVisibility(visible = showCreateProjectForm) {
@@ -568,6 +664,286 @@ fun WorkflowSetupWizardScreen(
                     modifier = Modifier.fillMaxWidth().height(54.dp).testTag("wizard_apply_all_button")
                 ) {
                     Text("全ワークフローへ反映して一括同期", fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Step 5: GitHub OAuth Device Flow & Organization Scope
+            WizardCard(
+                title = "GitHub OAuth Device Flow (組織・個人連携)",
+                icon = Icons.Rounded.Code,
+                completed = credentials.githubPat.isNotBlank() && credentials.githubAccountLogin.isNotBlank()
+            ) {
+                if (credentials.githubAccountLogin.isNotBlank()) {
+                    Text(
+                        text = "連携中アカウント: @${credentials.githubAccountLogin}" +
+                            if (credentials.githubSelectedOrg.isNotBlank()) " / Org: ${credentials.githubSelectedOrg}" else "",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                OutlinedTextField(
+                    value = githubClientIdInput,
+                    onValueChange = { githubClientIdInput = it },
+                    label = { Text("GitHub OAuth App Client ID (Device Flow)") },
+                    placeholder = { Text("Iv1.... / Ov23li...") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("wizard_github_client_id_input")
+                )
+                Button(
+                    onClick = { onStartGitHubDeviceFlow(githubClientIdInput) },
+                    enabled = githubClientIdInput.isNotBlank() && !wizardState.isBusy,
+                    modifier = Modifier.fillMaxWidth().height(48.dp).testTag("wizard_github_device_flow_start")
+                ) {
+                    Text("GitHub デバイスコードを発行")
+                }
+
+                if (gitHubDeviceChallenge != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "デバイスコード: ${gitHubDeviceChallenge.userCode}",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "下のボタンでブラウザを開きコードを入力した後、「承認完了を確認」を押してください。",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        copyText(context, "GitHub Device Code", gitHubDeviceChallenge.userCode)
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW, Uri.parse(gitHubDeviceChallenge.verificationUri))
+                                            )
+                                        }
+                                        onShowMessage("コードをコピーしてブラウザを開きました")
+                                    },
+                                    modifier = Modifier.weight(1f).height(48.dp)
+                                ) {
+                                    Icon(Icons.Rounded.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("コピー＆開く", maxLines = 1)
+                                }
+                                Button(
+                                    onClick = onCompleteGitHubDeviceFlow,
+                                    enabled = !wizardState.isBusy,
+                                    modifier = Modifier.weight(1f).height(48.dp).testTag("wizard_github_device_flow_poll")
+                                ) {
+                                    Text("承認完了を確認", maxLines = 1)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (gitHubOrganizations.isNotEmpty()) {
+                    Text("GitHub Organization 切替:", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = credentials.githubSelectedOrg.isBlank(),
+                            onClick = { onSelectGitHubOrg("") },
+                            label = { Text("すべて") }
+                        )
+                        gitHubOrganizations.forEach { org ->
+                            FilterChip(
+                                selected = credentials.githubSelectedOrg == org.login,
+                                onClick = { onSelectGitHubOrg(org.login) },
+                                label = { Text(org.login) }
+                            )
+                        }
+                    }
+                }
+
+                if (gitHubDiscoveredRepos.isNotEmpty()) {
+                    Text("検出リポジトリ (タップで選択):", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        gitHubDiscoveredRepos.take(12).forEach { repoFull ->
+                            FilterChip(
+                                selected = credentials.githubOwnerRepo == repoFull,
+                                onClick = {
+                                    githubRepoInput = repoFull
+                                    onSelectGitHubRepo(repoFull)
+                                },
+                                label = { Text(repoFull) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Step 6: Pluggable Connectors & Custom MCP Servers
+            WizardCard(
+                title = "プラガブル MCP サーバー & コネクタ管理",
+                icon = Icons.Rounded.Extension
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "登録済み MCP サーバー (${credentials.mcpEndpoints.size}件)",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    OutlinedButton(
+                        onClick = onRefreshConnectors,
+                        modifier = Modifier.height(48.dp).testTag("wizard_refresh_connectors_button")
+                    ) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("コネクタ再読込")
+                    }
+                }
+
+                credentials.mcpEndpoints.forEach { endpoint ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (endpoint.isActive) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                        },
+                        border = BorderStroke(
+                            1.dp,
+                            if (endpoint.isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                gatewayUrlInput = endpoint.url
+                                onSwitchMcpEndpoint(endpoint.id)
+                            }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = endpoint.isActive,
+                                onClick = {
+                                    gatewayUrlInput = endpoint.url
+                                    onSwitchMcpEndpoint(endpoint.id)
+                                }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(endpoint.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                Text(endpoint.url, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                            }
+                            if (credentials.mcpEndpoints.size > 1) {
+                                androidx.compose.material3.IconButton(
+                                    onClick = { onRemoveMcpEndpoint(endpoint.id) }
+                                ) {
+                                    Icon(Icons.Rounded.Delete, contentDescription = "MCP削除")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = customMcpLabel,
+                    onValueChange = { customMcpLabel = it },
+                    label = { Text("カスタム MCP 名 (任意)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = customMcpUrl,
+                    onValueChange = { customMcpUrl = it },
+                    label = { Text("追加 MCP Server URL (https://... または http://127.0.0.1:...)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("wizard_custom_mcp_url_input")
+                )
+                OutlinedTextField(
+                    value = customMcpBearer,
+                    onValueChange = { customMcpBearer = it },
+                    label = { Text("MCP Bearer Token (任意)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedButton(
+                    onClick = {
+                        onAddCustomMcpEndpoint(customMcpLabel, customMcpUrl, customMcpBearer)
+                        gatewayUrlInput = customMcpUrl.trim().trimEnd('/')
+                        customMcpLabel = ""
+                        customMcpUrl = ""
+                        customMcpBearer = ""
+                    },
+                    enabled = customMcpUrl.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth().height(48.dp).testTag("wizard_add_mcp_button")
+                ) {
+                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("この Google アカウントに MCP サーバーを追加")
+                }
+
+                if (connectorStatuses.isNotEmpty()) {
+                    Text("コネクタ接続状態:", style = MaterialTheme.typography.labelMedium)
+                    connectorStatuses.forEach { st ->
+                        Text(
+                            text = "• ${st.title}: ${if (st.connected) "接続済み" else "未接続"} — ${st.detail}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (st.connected) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (mcpTools.isNotEmpty()) {
+                    Text("利用可能 MCP ツール (${mcpTools.size}件・タップで試行):", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        mcpTools.forEach { tool ->
+                            OutlinedButton(
+                                onClick = { onExecuteMcpTool(tool.name) },
+                                modifier = Modifier.height(48.dp)
+                            ) {
+                                Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(tool.name, maxLines = 1)
+                            }
+                        }
+                    }
+                }
+
+                if (lastMcpToolResult != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "MCP[${lastMcpToolResult.toolName}]: ${lastMcpToolResult.output.take(400)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(20.dp))

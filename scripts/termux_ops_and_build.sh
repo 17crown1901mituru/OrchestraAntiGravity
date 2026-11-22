@@ -12,10 +12,10 @@ ORIGINAL_ARGS=("$@")
 # ==============================================================================
 # 0. Configurable Environment Variables (override before running as needed)
 # ==============================================================================
-GCP_PROJECT_ID="${GCP_PROJECT_ID:-gen-lang-client-0439741065}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-}"
 GCP_REGION="${GCP_REGION:-us-central1}"
-ALLOWED_EMAIL="${ALLOWED_EMAIL:-17crown2223@gmail.com}"
-TFSTATE_BUCKET="${TFSTATE_BUCKET:-antigravity-tfstate-prod-${GCP_PROJECT_ID}}"
+ALLOWED_EMAIL="${ALLOWED_EMAIL:-}"
+TFSTATE_BUCKET="${TFSTATE_BUCKET:-${GCP_PROJECT_ID:+antigravity-tfstate-prod-${GCP_PROJECT_ID}}}"
 GATEWAY_HEALTH_URL="${GATEWAY_HEALTH_URL:-https://gc2223.com/health}"
 
 BUILD_TYPE="${BUILD_TYPE:-debug}"          # debug | release | all
@@ -241,16 +241,13 @@ if command -v keytool >/dev/null 2>&1; then
   fi
 fi
 
-# Shared Bearer Token (used for both Cloudflare Worker and GCP Secret Manager out-of-band sync)
-NEW_AGENT_TOKEN="${AGENT_BEARER_TOKEN:-$(openssl rand -hex 32)}"
-
 # ==============================================================================
-# 3. Cloudflare Worker Secrets & Deploy
+# 3. Cloudflare Worker Stateless MCP Server Deploy (gc2223.com/*, Zero-PII)
 # ==============================================================================
 if [[ "$RUN_CF" == "true" ]]; then
   if [[ -d "${REPO_ROOT}/worker" && -f "${REPO_ROOT}/worker/wrangler.toml" ]]; then
     if command -v npx >/dev/null 2>&1 || command -v wrangler >/dev/null 2>&1; then
-      log "Configuring Cloudflare Worker secrets & deploying..."
+      log "Deploying Cloudflare Worker as a stateless MCP server (zero personal secrets on edge)..."
       pushd "${REPO_ROOT}/worker" >/dev/null
 
       WRANGLER_CMD=(npx --yes wrangler)
@@ -260,23 +257,13 @@ if [[ "$RUN_CF" == "true" ]]; then
         "${WRANGLER_CMD[@]}" whoami >/dev/null 2>&1 || "${WRANGLER_CMD[@]}" login
       fi
 
-      printf '%s' "$NEW_AGENT_TOKEN" | "${WRANGLER_CMD[@]}" secret put AGENT_BEARER_TOKEN
-      printf '%s' "$GCP_PROJECT_ID"  | "${WRANGLER_CMD[@]}" secret put FIREBASE_PROJECT_ID
-      printf '%s' "$ALLOWED_EMAIL"   | "${WRANGLER_CMD[@]}" secret put ALLOWED_FIREBASE_EMAIL
-
-      if [[ -n "${GITHUB_PAT:-}" ]]; then
-        printf '%s' "$GITHUB_PAT" | "${WRANGLER_CMD[@]}" secret put GITHUB_PAT
-      else
-        warn "GITHUB_PAT env var not set; skipping automatic GITHUB_PAT secret update."
-      fi
-      if [[ -n "${RESEND_API_KEY:-}" ]]; then
-        printf '%s' "$RESEND_API_KEY" | "${WRANGLER_CMD[@]}" secret put RESEND_API_KEY
-      else
-        warn "RESEND_API_KEY env var not set; skipping automatic RESEND_API_KEY secret update."
-      fi
-
-      "${WRANGLER_CMD[@]}" secret list
-      "${WRANGLER_CMD[@]}" deploy
+      # Stateless MCP Server policy:
+      # Do NOT push personal secrets (ALLOWED_FIREBASE_EMAIL, GITHUB_PAT,
+      # FIREBASE_PROJECT_ID, RESEND_API_KEY, etc.) to Cloudflare Workers.
+      # Request-scoped auth headers/OAuth tokens are validated dynamically per call.
+      "${WRANGLER_CMD[@]}" deploy \
+        --var "STATELESS_MCP_MODE:true" \
+        --var "MCP_ROUTE:gc2223.com/*"
       popd >/dev/null
     else
       warn "wrangler/npx not found; skipping Cloudflare Worker step."
@@ -291,68 +278,78 @@ fi
 # ==============================================================================
 if [[ "$RUN_GCP_TF" == "true" ]]; then
   if command -v gcloud >/dev/null 2>&1; then
-    log "Configuring GCP APIs, CMEK tfstate bucket, and Secret Manager..."
-    if ! gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
-      gcloud auth login --no-launch-browser
+    if [[ -z "$GCP_PROJECT_ID" ]]; then
+      GCP_PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
     fi
-    gcloud config set project "$GCP_PROJECT_ID" >/dev/null
+    if [[ -z "$GCP_PROJECT_ID" || "$GCP_PROJECT_ID" == "(unset)" ]]; then
+      GCP_PROJECT_ID=""
+      warn "GCP_PROJECT_ID is not set and no active gcloud project is configured; skipping GCP CMEK & Secret Manager steps."
+    else
+      TFSTATE_BUCKET="${TFSTATE_BUCKET:-antigravity-tfstate-prod-${GCP_PROJECT_ID}}"
+      log "Configuring GCP APIs, CMEK tfstate bucket, and Secret Manager for project '${GCP_PROJECT_ID}'..."
+      if ! gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+        gcloud auth login --no-launch-browser
+      fi
+      gcloud config set project "$GCP_PROJECT_ID" >/dev/null
 
-    if [[ -f "${HOME}/.config/gcloud/application_default_credentials.json" ]]; then
-      gcloud auth application-default set-quota-project "$GCP_PROJECT_ID" >/dev/null 2>&1 || true
-    fi
-
-    # Optional automatic billing link if BILLING_ACCOUNT_ID is supplied
-    if [[ -n "${BILLING_ACCOUNT_ID:-}" ]]; then
-      log "Linking billing account ${BILLING_ACCOUNT_ID} to ${GCP_PROJECT_ID}..."
-      gcloud billing projects link "$GCP_PROJECT_ID" --billing-account="$BILLING_ACCOUNT_ID" || \
-        warn "Failed to link billing account ${BILLING_ACCOUNT_ID}."
-    fi
-
-    # Always attempt zero-billing App Check / Play Integrity APIs safely
-    gcloud services enable firebaseappcheck.googleapis.com playintegrity.googleapis.com 2>/dev/null || true
-
-    BILLING_ENABLED="$(gcloud billing projects describe "$GCP_PROJECT_ID" --format='value(billingEnabled)' 2>/dev/null || echo 'False')"
-    if [[ "$BILLING_ENABLED" == "True" ]]; then
-      gcloud services enable \
-        cloudkms.googleapis.com \
-        storage.googleapis.com \
-        secretmanager.googleapis.com
-
-      gcloud kms keyrings create antigravity-tfstate-ring --location="$GCP_REGION" 2>/dev/null || true
-      gcloud kms keys create tfstate-cmek-key \
-        --keyring=antigravity-tfstate-ring \
-        --location="$GCP_REGION" \
-        --purpose=encryption 2>/dev/null || true
-
-      PROJECT_NUMBER="$(gcloud projects describe "$GCP_PROJECT_ID" --format='value(projectNumber)')"
-      KMS_KEY_ID="projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/keyRings/antigravity-tfstate-ring/cryptoKeys/tfstate-cmek-key"
-
-      gcloud kms keys add-iam-policy-binding tfstate-cmek-key \
-        --keyring=antigravity-tfstate-ring \
-        --location="$GCP_REGION" \
-        --member="serviceAccount:service-${PROJECT_NUMBER}@gs-project-accounts.iam.gserviceaccount.com" \
-        --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" >/dev/null
-
-      if ! gcloud storage buckets describe "gs://${TFSTATE_BUCKET}" >/dev/null 2>&1; then
-        gcloud storage buckets create "gs://${TFSTATE_BUCKET}" \
-          --location="$GCP_REGION" \
-          --uniform-bucket-level-access \
-          --default-encryption-key="$KMS_KEY_ID"
-        gcloud storage buckets update "gs://${TFSTATE_BUCKET}" --versioning
-      else
-        log "GCS tfstate bucket gs://${TFSTATE_BUCKET} already exists."
+      if [[ -f "${HOME}/.config/gcloud/application_default_credentials.json" ]]; then
+        gcloud auth application-default set-quota-project "$GCP_PROJECT_ID" >/dev/null 2>&1 || true
       fi
 
-      # Push bearer secret directly out-of-band (never stored in tfstate)
-      gcloud secrets create antigravity-agent-bearer-master --replication-policy="automatic" 2>/dev/null || true
-      printf '%s' "$NEW_AGENT_TOKEN" | gcloud secrets versions add antigravity-agent-bearer-master --data-file=- >/dev/null
-      log "Added new secret version to antigravity-agent-bearer-master out-of-band."
-    else
-      warn "GCP billing is NOT enabled on '${GCP_PROJECT_ID}' (billingEnabled=${BILLING_ENABLED})."
-      warn "Skipping billing-required APIs (Secret Manager / Cloud KMS / GCS CMEK tfstate) and continuing to build."
-      warn "To enable & run them: run 'gcloud billing accounts list', then re-run with:"
-      warn "  BILLING_ACCOUNT_ID=XXXXXX-XXXXXX-XXXXXX bash scripts/termux_ops_and_build.sh"
-      warn "Or keep zero-cost mode cleanly by passing: --skip-tf"
+      # Optional automatic billing link if BILLING_ACCOUNT_ID is supplied
+      if [[ -n "${BILLING_ACCOUNT_ID:-}" ]]; then
+        log "Linking billing account ${BILLING_ACCOUNT_ID} to ${GCP_PROJECT_ID}..."
+        gcloud billing projects link "$GCP_PROJECT_ID" --billing-account="$BILLING_ACCOUNT_ID" || \
+          warn "Failed to link billing account ${BILLING_ACCOUNT_ID}."
+      fi
+
+      # Always attempt zero-billing App Check / Play Integrity APIs safely
+      gcloud services enable firebaseappcheck.googleapis.com playintegrity.googleapis.com 2>/dev/null || true
+
+      BILLING_ENABLED="$(gcloud billing projects describe "$GCP_PROJECT_ID" --format='value(billingEnabled)' 2>/dev/null || echo 'False')"
+      if [[ "$BILLING_ENABLED" == "True" ]]; then
+        gcloud services enable \
+          cloudkms.googleapis.com \
+          storage.googleapis.com \
+          secretmanager.googleapis.com
+
+        gcloud kms keyrings create antigravity-tfstate-ring --location="$GCP_REGION" 2>/dev/null || true
+        gcloud kms keys create tfstate-cmek-key \
+          --keyring=antigravity-tfstate-ring \
+          --location="$GCP_REGION" \
+          --purpose=encryption 2>/dev/null || true
+
+        PROJECT_NUMBER="$(gcloud projects describe "$GCP_PROJECT_ID" --format='value(projectNumber)')"
+        KMS_KEY_ID="projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/keyRings/antigravity-tfstate-ring/cryptoKeys/tfstate-cmek-key"
+
+        gcloud kms keys add-iam-policy-binding tfstate-cmek-key \
+          --keyring=antigravity-tfstate-ring \
+          --location="$GCP_REGION" \
+          --member="serviceAccount:service-${PROJECT_NUMBER}@gs-project-accounts.iam.gserviceaccount.com" \
+          --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" >/dev/null
+
+        if ! gcloud storage buckets describe "gs://${TFSTATE_BUCKET}" >/dev/null 2>&1; then
+          gcloud storage buckets create "gs://${TFSTATE_BUCKET}" \
+            --location="$GCP_REGION" \
+            --uniform-bucket-level-access \
+            --default-encryption-key="$KMS_KEY_ID"
+          gcloud storage buckets update "gs://${TFSTATE_BUCKET}" --versioning
+        else
+          log "GCS tfstate bucket gs://${TFSTATE_BUCKET} already exists."
+        fi
+
+        # Push user-owned GCP bearer secret directly out-of-band (never stored in tfstate or edge)
+        NEW_AGENT_TOKEN="${AGENT_BEARER_TOKEN:-$(openssl rand -hex 32)}"
+        gcloud secrets create antigravity-agent-bearer-master --replication-policy="automatic" 2>/dev/null || true
+        printf '%s' "$NEW_AGENT_TOKEN" | gcloud secrets versions add antigravity-agent-bearer-master --data-file=- >/dev/null
+        log "Added new secret version to antigravity-agent-bearer-master out-of-band."
+      else
+        warn "GCP billing is NOT enabled on '${GCP_PROJECT_ID}' (billingEnabled=${BILLING_ENABLED})."
+        warn "Skipping billing-required APIs (Secret Manager / Cloud KMS / GCS CMEK tfstate) and continuing to build."
+        warn "To enable & run them: run 'gcloud billing accounts list', then re-run with:"
+        warn "  GCP_PROJECT_ID=<your-project> BILLING_ACCOUNT_ID=XXXXXX-XXXXXX-XXXXXX bash scripts/termux_ops_and_build.sh"
+        warn "Or keep zero-cost mode cleanly by passing: --skip-tf"
+      fi
     fi
   else
     warn "gcloud not found; skipping GCP CMEK & Secret Manager steps."
@@ -363,26 +360,34 @@ if [[ "$RUN_GCP_TF" == "true" ]]; then
       log "Running Terraform validate / plan in infra/..."
       pushd "${REPO_ROOT}/infra" >/dev/null
 
+      SKIP_TF_EXEC="false"
       if grep -qE '^[[:space:]]*backend "gcs"' main.tf; then
-        terraform init -reconfigure \
-          -backend-config="bucket=${TFSTATE_BUCKET}" \
-          -backend-config="prefix=terraform/state"
+        if [[ -z "$TFSTATE_BUCKET" ]]; then
+          warn "TFSTATE_BUCKET is empty (set GCP_PROJECT_ID or TFSTATE_BUCKET); skipping GCS-backed Terraform execution."
+          SKIP_TF_EXEC="true"
+        else
+          terraform init -reconfigure \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="prefix=terraform/state"
+        fi
       else
         terraform init -input=false
       fi
 
-      terraform validate
-      terraform plan -input=false -var="cloud_run_deletion_protection=${CLOUD_RUN_DELETION_PROTECTION}" -out=tfplan
+      if [[ "$SKIP_TF_EXEC" != "true" ]]; then
+        terraform validate
+        terraform plan -input=false -var="cloud_run_deletion_protection=${CLOUD_RUN_DELETION_PROTECTION}" -out=tfplan
 
-      if [[ "$TF_APPLY" == "true" ]]; then
-        log "Applying Terraform plan..."
-        terraform apply -input=false tfplan
-      else
-        warn "Plan-only mode (pass --apply to execute terraform apply)."
+        if [[ "$TF_APPLY" == "true" ]]; then
+          log "Applying Terraform plan..."
+          terraform apply -input=false tfplan
+        else
+          warn "Plan-only mode (pass --apply to execute terraform apply)."
+        fi
+
+        log "Checking Cloudflare provider v5 migration targets (informational):"
+        grep -rnE 'cloudflare_email_routing_rule|cloudflare_workers_kv_namespace|cloudflare_r2_bucket' . || true
       fi
-
-      log "Checking Cloudflare provider v5 migration targets (informational):"
-      grep -rnE 'cloudflare_email_routing_rule|cloudflare_workers_kv_namespace|cloudflare_r2_bucket' . || true
       popd >/dev/null
     else
       warn "terraform not found; skipping Terraform execution."

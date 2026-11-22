@@ -1,10 +1,12 @@
 package com.example
 
+import com.example.auth.GoogleAccountSession
 import com.example.auth.validateWebClientId
 import com.example.security.AppSignatureHelper
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GcpAuthValidationUnitTest {
@@ -23,6 +25,24 @@ class GcpAuthValidationUnitTest {
     }
 
     @Test
+    fun googleAccountSession_buildsDeterministicVirtualAliasFromSub() {
+        val session = GoogleAccountSession.create(
+            sub = "108239481029384019283",
+            accessToken = "ya29.test-oauth-token"
+        )
+        assertTrue(session.isValid)
+        assertEquals("108239481029384019283", session.sub)
+        assertTrue(Regex("^u-[0-9a-f]{12}@gc2223\\.com$").matches(session.virtualAlias))
+        assertEquals(
+            session.virtualAlias,
+            GoogleAccountSession.buildVirtualAlias(" 108239481029384019283 ")
+        )
+
+        val invalidSession = GoogleAccountSession.create(sub = "108239481029384019283")
+        assertFalse(invalidSession.isValid)
+    }
+
+    @Test
     fun appSignatureHelper_formatsAndNormalizesFingerprints() {
         val bytes = "antigravity-release-cert".toByteArray(Charsets.UTF_8)
         val sha1 = AppSignatureHelper.digestColonHex("SHA-1", bytes)
@@ -35,3 +55,4 @@ class GcpAuthValidationUnitTest {
         assertEquals(64, normalized.length)
     }
 }
+

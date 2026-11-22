@@ -68,7 +68,7 @@ class FirestoreRepository(
             val existing = colRef.limit(1).get().await()
             if (!existing.isEmpty) return Result.success(Unit)
 
-            val hint = accountEmail.ifBlank { "17crown2223@gmail.com" }.take(120)
+            val hint = accountEmail.ifBlank { "google-account" }.take(120)
             val defaults = listOf(
                 "cloudflare_gc2223" to mapOf(
                     "userId" to uid,

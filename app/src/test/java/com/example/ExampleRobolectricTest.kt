@@ -74,7 +74,7 @@ class ExampleRobolectricTest {
 
     val loaded = store.loadForUser("uid_1234")
     assertEquals("https://gc2223.com", loaded.gc2223Endpoint)
-    assertEquals("gen-lang-client-0439741065", loaded.gcpProjectId)
+    assertEquals("", loaded.gcpProjectId)
   }
 
   @Test

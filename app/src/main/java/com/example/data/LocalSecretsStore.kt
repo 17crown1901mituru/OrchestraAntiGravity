@@ -6,7 +6,9 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
 import com.example.model.ExternalCredentials
+import com.example.model.McpEndpointEntry
 import com.example.model.VaultMetadata
+import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.security.KeyStore
@@ -30,13 +32,16 @@ class LocalSecretsStore(context: Context) {
 
     fun loadForUser(uid: String): ExternalCredentials {
         if (uid.isBlank()) return ExternalCredentials()
-        val encoded = prefs.getString(vaultKey(uid), null) ?: return ExternalCredentials()
+        val sub = uid.trim()
+        val encoded = prefs.getString(vaultKey(sub), null) ?: return ExternalCredentials()
         return try {
-            val plaintext = decrypt(uid, encoded)
+            val plaintext = decrypt(sub, encoded)
             val json = JSONObject(plaintext)
+            val endpoint = json.optString("gc2223Endpoint", "https://gc2223.com")
+                .ifBlank { "https://gc2223.com" }
+            val parsedMcp = parseMcpEndpoints(json.optJSONArray("mcpEndpoints"), endpoint)
             ExternalCredentials(
-                gc2223Endpoint = json.optString("gc2223Endpoint", "https://gc2223.com")
-                    .ifBlank { "https://gc2223.com" },
+                gc2223Endpoint = endpoint,
                 gc2223BearerToken = json.optString("gc2223BearerToken", ""),
                 cloudflareApiToken = json.optString("cloudflareApiToken", ""),
                 cloudflareAccountId = json.optString("cloudflareAccountId", ""),
@@ -44,16 +49,19 @@ class LocalSecretsStore(context: Context) {
                 githubOwnerRepo = json.optString("githubOwnerRepo", ""),
                 githubWorkflowFile = json.optString("githubWorkflowFile", "antigravity-deploy.yml")
                     .ifBlank { "antigravity-deploy.yml" },
-                gcpProjectId = json.optString("gcpProjectId", "gen-lang-client-0439741065")
-                    .ifBlank { "gen-lang-client-0439741065" },
+                githubOAuthClientId = json.optString("githubOAuthClientId", ""),
+                githubAccountLogin = json.optString("githubAccountLogin", ""),
+                githubSelectedOrg = json.optString("githubSelectedOrg", ""),
+                gcpProjectId = json.optString("gcpProjectId", ""),
                 gcpApiKeyOrToken = json.optString("gcpApiKeyOrToken", ""),
                 gcpBillingAccountId = json.optString("gcpBillingAccountId", ""),
                 termuxAgentUrl = json.optString("termuxAgentUrl", "http://127.0.0.1:8787")
                     .ifBlank { "http://127.0.0.1:8787" },
-                termuxAgentToken = json.optString("termuxAgentToken", "")
+                termuxAgentToken = json.optString("termuxAgentToken", ""),
+                mcpEndpoints = parsedMcp
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to decrypt local vault for user $uid", e)
+            Log.e(TAG, "Failed to decrypt local vault for subject $sub", e)
             ExternalCredentials()
         }
     }
@@ -63,10 +71,24 @@ class LocalSecretsStore(context: Context) {
         email: String,
         credentials: ExternalCredentials
     ): Result<VaultMetadata> {
-        if (uid.isBlank()) {
-            return Result.failure(IllegalStateException("Authenticated Firebase UID is required."))
+        val sub = uid.trim()
+        if (sub.isBlank()) {
+            return Result.failure(IllegalStateException("Authenticated Google sub / UID is required."))
         }
         return try {
+            val mcpArr = JSONArray().apply {
+                credentials.mcpEndpoints.forEach { entry ->
+                    if (entry.url.isNotBlank()) {
+                        put(JSONObject().apply {
+                            put("id", entry.id.trim())
+                            put("label", entry.label.trim())
+                            put("url", entry.url.trim().trimEnd('/'))
+                            put("bearerToken", entry.bearerToken.trim())
+                            put("isActive", entry.isActive)
+                        })
+                    }
+                }
+            }
             val payload = JSONObject().apply {
                 put("gc2223Endpoint", credentials.gc2223Endpoint.trim())
                 put("gc2223BearerToken", credentials.gc2223BearerToken.trim())
@@ -75,22 +97,26 @@ class LocalSecretsStore(context: Context) {
                 put("githubPat", credentials.githubPat.trim())
                 put("githubOwnerRepo", credentials.githubOwnerRepo.trim())
                 put("githubWorkflowFile", credentials.githubWorkflowFile.trim())
+                put("githubOAuthClientId", credentials.githubOAuthClientId.trim())
+                put("githubAccountLogin", credentials.githubAccountLogin.trim())
+                put("githubSelectedOrg", credentials.githubSelectedOrg.trim())
                 put("gcpProjectId", credentials.gcpProjectId.trim())
                 put("gcpApiKeyOrToken", credentials.gcpApiKeyOrToken.trim())
                 put("gcpBillingAccountId", credentials.gcpBillingAccountId.trim())
                 put("termuxAgentUrl", credentials.termuxAgentUrl.trim().ifBlank { "http://127.0.0.1:8787" })
                 put("termuxAgentToken", credentials.termuxAgentToken.trim())
+                put("mcpEndpoints", mcpArr)
             }.toString()
 
-            val encrypted = encrypt(uid, payload)
+            val encrypted = encrypt(sub, payload)
             val now = System.currentTimeMillis()
             prefs.edit()
-                .putString(vaultKey(uid), encrypted)
-                .putLong(updatedKey(uid), now)
-                .putString(emailKey(uid), email)
+                .putString(vaultKey(sub), encrypted)
+                .putLong(updatedKey(sub), now)
+                .putString(emailKey(sub), email)
                 .apply()
 
-            Result.success(getVaultMetadata(uid, email))
+            Result.success(getVaultMetadata(sub, email))
         } catch (e: Exception) {
             Log.e(TAG, "Failed to encrypt and save local vault", e)
             Result.failure(e)
@@ -98,21 +124,22 @@ class LocalSecretsStore(context: Context) {
     }
 
     fun clearForUser(uid: String, email: String): Result<VaultMetadata> {
-        if (uid.isBlank()) {
-            return Result.failure(IllegalStateException("Authenticated Firebase UID is required."))
+        val sub = uid.trim()
+        if (sub.isBlank()) {
+            return Result.failure(IllegalStateException("Authenticated Google sub / UID is required."))
         }
         return try {
             prefs.edit()
-                .remove(vaultKey(uid))
-                .remove(updatedKey(uid))
-                .remove(emailKey(uid))
+                .remove(vaultKey(sub))
+                .remove(updatedKey(sub))
+                .remove(emailKey(sub))
                 .apply()
             val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-            val alias = keyAlias(uid)
+            val alias = keyAlias(sub)
             if (keyStore.containsAlias(alias)) {
                 keyStore.deleteEntry(alias)
             }
-            Result.success(getVaultMetadata(uid, email))
+            Result.success(getVaultMetadata(sub, email))
         } catch (e: Exception) {
             Log.e(TAG, "Failed to clear encrypted vault", e)
             Result.failure(e)
@@ -120,11 +147,12 @@ class LocalSecretsStore(context: Context) {
     }
 
     fun getVaultMetadata(uid: String, email: String): VaultMetadata {
-        val hasSecrets = uid.isNotBlank() && prefs.contains(vaultKey(uid))
-        val updatedAt = if (uid.isNotBlank()) prefs.getLong(updatedKey(uid), 0L) else 0L
-        val storedEmail = if (uid.isNotBlank()) prefs.getString(emailKey(uid), email).orEmpty() else email
+        val sub = uid.trim()
+        val hasSecrets = sub.isNotBlank() && prefs.contains(vaultKey(sub))
+        val updatedAt = if (sub.isNotBlank()) prefs.getLong(updatedKey(sub), 0L) else 0L
+        val storedEmail = if (sub.isNotBlank()) prefs.getString(emailKey(sub), email).orEmpty() else email
         return VaultMetadata(
-            linkedUid = uid,
+            linkedUid = sub,
             linkedEmail = storedEmail.ifBlank { email },
             cipherAlgorithm = "AES-256-GCM (AndroidKeyStore)",
             updatedAtEpochMs = updatedAt,
@@ -182,8 +210,48 @@ class LocalSecretsStore(context: Context) {
         return String(plaintext, Charsets.UTF_8)
     }
 
-    private fun keyAlias(uid: String) = "$KEY_ALIAS_PREFIX$uid"
-    private fun vaultKey(uid: String) = "vault_$uid"
-    private fun updatedKey(uid: String) = "vault_updated_$uid"
-    private fun emailKey(uid: String) = "vault_email_$uid"
+    private fun parseMcpEndpoints(
+        arr: JSONArray?,
+        fallbackEndpoint: String
+    ): List<McpEndpointEntry> {
+        val list = mutableListOf<McpEndpointEntry>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val url = obj.optString("url", "").trim().trimEnd('/')
+                if (url.isBlank()) continue
+                list.add(
+                    McpEndpointEntry(
+                        id = obj.optString("id", "mcp_$i").ifBlank { "mcp_$i" },
+                        label = obj.optString("label", url).ifBlank { url },
+                        url = url,
+                        bearerToken = obj.optString("bearerToken", ""),
+                        isActive = obj.optBoolean("isActive", false)
+                    )
+                )
+            }
+        }
+        if (list.isEmpty()) {
+            val clean = fallbackEndpoint.trim().trimEnd('/').ifBlank { "https://gc2223.com" }
+            list.add(
+                McpEndpointEntry(
+                    id = "default_gc2223",
+                    label = "gc2223.com Stateless MCP",
+                    url = clean,
+                    isActive = true
+                )
+            )
+        } else if (list.none { it.isActive }) {
+            list[0] = list[0].copy(isActive = true)
+        }
+        return list
+    }
+
+    private fun safeSubKey(sub: String): String =
+        sub.trim().replace(Regex("[^A-Za-z0-9_-]"), "_")
+
+    private fun keyAlias(uid: String) = "$KEY_ALIAS_PREFIX${safeSubKey(uid)}"
+    private fun vaultKey(uid: String) = "vault_${safeSubKey(uid)}"
+    private fun updatedKey(uid: String) = "vault_updated_${safeSubKey(uid)}"
+    private fun emailKey(uid: String) = "vault_email_${safeSubKey(uid)}"
 }

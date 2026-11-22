@@ -142,6 +142,12 @@ fun MainHubScreen(
     val syncSettings by viewModel.syncSettingsState.collectAsStateWithLifecycle()
     val syncWorkState by viewModel.syncWorkState.collectAsStateWithLifecycle()
     val gcpWizardState by viewModel.gcpWizardState.collectAsStateWithLifecycle()
+    val connectorStatuses by viewModel.connectorStatuses.collectAsStateWithLifecycle()
+    val mcpTools by viewModel.mcpTools.collectAsStateWithLifecycle()
+    val gitHubDeviceChallenge by viewModel.gitHubDeviceChallenge.collectAsStateWithLifecycle()
+    val gitHubOrganizations by viewModel.gitHubOrganizations.collectAsStateWithLifecycle()
+    val gitHubDiscoveredRepos by viewModel.gitHubDiscoveredRepos.collectAsStateWithLifecycle()
+    val lastMcpToolResult by viewModel.lastMcpToolResult.collectAsStateWithLifecycle()
 
     LaunchedEffect(statusBanner) {
         val msg = statusBanner
@@ -402,16 +408,33 @@ fun MainHubScreen(
                                     userEmail = userEmail,
                                     wizardState = gcpWizardState,
                                     credentials = credentials,
+                                    connectorStatuses = connectorStatuses,
+                                    mcpTools = mcpTools,
+                                    gitHubDeviceChallenge = gitHubDeviceChallenge,
+                                    gitHubOrganizations = gitHubOrganizations,
+                                    gitHubDiscoveredRepos = gitHubDiscoveredRepos,
+                                    lastMcpToolResult = lastMcpToolResult,
                                     onOAuthTokenAcquired = viewModel::onGcpOAuthTokenAcquired,
                                     onOAuthError = viewModel::onGcpOAuthFailed,
-                                    onLoadProjects = viewModel::loadGcpProjectsAndBilling,
+                                    onLoadProjects = viewModel::discoverAccountResources,
+                                    onSelectOrganization = viewModel::selectOrganizationFilter,
                                     onSelectProject = viewModel::selectGcpProject,
+                                    onSelectGeminiModel = viewModel::selectGeminiModel,
                                     onCreateProject = viewModel::createGcpProjectAndSelect,
                                     onLinkBillingAccount = viewModel::linkGcpBillingAccount,
                                     onToggleApiSelection = viewModel::toggleGcpApiSelection,
                                     onRefreshApis = viewModel::refreshEnabledGcpApis,
                                     onEnableSelectedApis = viewModel::enableSelectedGcpApis,
                                     onSyncFirebase = viewModel::syncFirebaseForSelectedProject,
+                                    onStartGitHubDeviceFlow = viewModel::startGitHubDeviceFlow,
+                                    onCompleteGitHubDeviceFlow = viewModel::completeGitHubDeviceFlowPolling,
+                                    onSelectGitHubOrg = viewModel::selectGitHubOrganization,
+                                    onSelectGitHubRepo = viewModel::selectGitHubRepository,
+                                    onAddCustomMcpEndpoint = viewModel::addCustomMcpEndpoint,
+                                    onSwitchMcpEndpoint = viewModel::switchActiveMcpEndpoint,
+                                    onRemoveMcpEndpoint = viewModel::removeCustomMcpEndpoint,
+                                    onRefreshConnectors = viewModel::refreshAllConnectors,
+                                    onExecuteMcpTool = { toolName -> viewModel.executeMcpTool(toolName) },
                                     onExportPortableBackupJson = viewModel::exportPortableBootstrapJson,
                                     onApplyAllWorkflows = viewModel::applyWizardToWorkflowNodesAndSync,
                                     onVerifyCloudflareGateway = { url ->

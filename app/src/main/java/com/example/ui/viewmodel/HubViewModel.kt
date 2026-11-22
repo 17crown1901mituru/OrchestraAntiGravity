@@ -8,6 +8,13 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.auth.InMemoryOAuthSessionStore
+import com.example.connectors.ConnectorContext
+import com.example.connectors.ConnectorStatus
+import com.example.connectors.GitHubDeviceCodeChallenge
+import com.example.connectors.GitHubOrganizationSummary
+import com.example.connectors.HubConnectorRegistry
+import com.example.connectors.McpToolDefinition
+import com.example.connectors.McpToolExecutionResult
 import com.example.data.BridgeCallResult
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
@@ -20,6 +27,7 @@ import com.example.data.RuntimeCloudBootstrapStore
 import com.example.data.StackTemplates
 import com.example.data.SyncSnapshotStore
 import com.example.data.WebContextCrawler
+import com.example.firebase.configureAppCheck
 import com.example.model.AgentBlueprint
 import com.example.model.AiGenerationState
 import com.example.model.AskRagResult
@@ -52,18 +60,23 @@ import com.example.sync.BackgroundSyncScheduler
 import com.example.sync.SyncWorkUiState
 import com.example.widget.updateGlanceWidgetFromState
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.generationConfig
+import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
+import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -71,22 +84,45 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
+import java.util.UUID
 
 private const val TAG = "HubViewModel"
 private const val STOP_TIMEOUT_MILLIS = 5000L
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class HubViewModel(
     appContext: Context,
-    private val repository: FirestoreRepository,
+    repository: FirestoreRepository? = null,
     private val secretsStore: LocalSecretsStore,
     private val syncSnapshotStore: SyncSnapshotStore,
     private val bridgeClient: CloudBridgeClient,
     private val currentUserId: String,
     private val userEmail: String,
-    private val gcpClient: GcpProvisioningClient = GcpProvisioningClient()
+    private val gcpClient: GcpProvisioningClient = GcpProvisioningClient(),
+    private val connectorRegistry: HubConnectorRegistry = HubConnectorRegistry(),
+    private val onFirebaseProvisioned: () -> Unit = {}
 ) : ViewModel() {
 
     private val applicationContext = appContext.applicationContext
+    private val _repositoryFlow = MutableStateFlow(repository)
+
+    private fun isFirebaseInitialized(): Boolean =
+        FirebaseApp.getApps(applicationContext).isNotEmpty()
+
+    private fun cloudRepoAndUid(): Pair<FirestoreRepository, String>? {
+        val repo = _repositoryFlow.value ?: return null
+        if (!isFirebaseInitialized()) return null
+        val cloudUid = runCatching { Firebase.auth.currentUser?.uid }.getOrNull() ?: return null
+        return repo to cloudUid
+    }
+
+    private val _localNodes = MutableStateFlow(buildDefaultLocalNodes(currentUserId, userEmail))
+    private val _localBlueprints = MutableStateFlow<List<AgentBlueprint>>(emptyList())
+    private val _localCostConfig = MutableStateFlow(
+        CostConfig(userId = currentUserId, alertEmail = userEmail)
+    )
+    private val _localCostEntries = MutableStateFlow<List<CostEntry>>(emptyList())
+    private val _localCostAlerts = MutableStateFlow<List<CostAlert>>(emptyList())
 
     private val chatModel by lazy {
         Firebase.ai.generativeModel(modelName = "gemini-3.8-flash")
@@ -117,74 +153,126 @@ class HubViewModel(
         )
     }
 
-    val nodesState: StateFlow<StreamUiState<List<WorkflowNode>>> = repository.observeNodes(currentUserId)
-        .map<List<WorkflowNode>, StreamUiState<List<WorkflowNode>>> { StreamUiState.Success(it) }
-        .catch { error ->
-            emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load workflow nodes")))
+    val nodesState: StateFlow<StreamUiState<List<WorkflowNode>>> = _repositoryFlow
+        .flatMapLatest { repo ->
+            val cloudUid = if (repo != null && isFirebaseInitialized()) {
+                runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+            } else null
+            if (repo != null && cloudUid != null) {
+                repo.observeNodes(cloudUid)
+                    .map<List<WorkflowNode>, StreamUiState<List<WorkflowNode>>> { StreamUiState.Success(it) }
+                    .catch { error ->
+                        emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load workflow nodes")))
+                    }
+            } else {
+                _localNodes.map { StreamUiState.Success(it) }
+            }
         }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = StreamUiState.Loading
+            initialValue = StreamUiState.Success(_localNodes.value)
         )
 
-    val blueprintsState: StateFlow<StreamUiState<List<AgentBlueprint>>> = repository.observeBlueprints(currentUserId)
-        .map<List<AgentBlueprint>, StreamUiState<List<AgentBlueprint>>> { list ->
-            val sorted = list.sortedByDescending { it.updatedAt?.seconds ?: it.createdAt?.seconds ?: 0L }
-            StreamUiState.Success(sorted)
-        }
-        .catch { error ->
-            emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load blueprints")))
+    val blueprintsState: StateFlow<StreamUiState<List<AgentBlueprint>>> = _repositoryFlow
+        .flatMapLatest { repo ->
+            val cloudUid = if (repo != null && isFirebaseInitialized()) {
+                runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+            } else null
+            if (repo != null && cloudUid != null) {
+                repo.observeBlueprints(cloudUid)
+                    .map<List<AgentBlueprint>, StreamUiState<List<AgentBlueprint>>> { list ->
+                        val sorted = list.sortedByDescending { it.updatedAt?.seconds ?: it.createdAt?.seconds ?: 0L }
+                        StreamUiState.Success(sorted)
+                    }
+                    .catch { error ->
+                        emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load blueprints")))
+                    }
+            } else {
+                _localBlueprints.map { StreamUiState.Success(it) }
+            }
         }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = StreamUiState.Loading
+            initialValue = StreamUiState.Success(emptyList())
         )
 
-    val costConfigState: StateFlow<CostConfig> = repository.observeCostConfig(currentUserId)
-        .catch { error ->
-            unwrapFirestoreError(error, "Failed to observe cost config")
-            emit(CostConfig(userId = currentUserId, alertEmail = userEmail.ifBlank { "17crown2223@gmail.com" }))
+    val costConfigState: StateFlow<CostConfig> = _repositoryFlow
+        .flatMapLatest { repo ->
+            val cloudUid = if (repo != null && isFirebaseInitialized()) {
+                runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+            } else null
+            if (repo != null && cloudUid != null) {
+                repo.observeCostConfig(cloudUid)
+                    .catch { error ->
+                        unwrapFirestoreError(error, "Failed to observe cost config")
+                        emit(CostConfig(userId = cloudUid, alertEmail = userEmail))
+                    }
+            } else {
+                _localCostConfig
+            }
         }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = CostConfig(userId = currentUserId, alertEmail = userEmail.ifBlank { "17crown2223@gmail.com" })
+            initialValue = CostConfig(userId = currentUserId, alertEmail = userEmail)
         )
 
-    val costEntriesState: StateFlow<StreamUiState<List<CostEntry>>> = repository.observeCostEntries(currentUserId)
-        .map<List<CostEntry>, StreamUiState<List<CostEntry>>> { list ->
-            val sorted = list.sortedByDescending { it.createdAt?.seconds ?: 0L }
-            StreamUiState.Success(sorted)
-        }
-        .catch { error ->
-            emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load cost entries")))
+    val costEntriesState: StateFlow<StreamUiState<List<CostEntry>>> = _repositoryFlow
+        .flatMapLatest { repo ->
+            val cloudUid = if (repo != null && isFirebaseInitialized()) {
+                runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+            } else null
+            if (repo != null && cloudUid != null) {
+                repo.observeCostEntries(cloudUid)
+                    .map<List<CostEntry>, StreamUiState<List<CostEntry>>> { list ->
+                        val sorted = list.sortedByDescending { it.createdAt?.seconds ?: 0L }
+                        StreamUiState.Success(sorted)
+                    }
+                    .catch { error ->
+                        emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load cost entries")))
+                    }
+            } else {
+                _localCostEntries.map { StreamUiState.Success(it) }
+            }
         }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = StreamUiState.Loading
+            initialValue = StreamUiState.Success(emptyList())
         )
 
-    val costAlertsState: StateFlow<StreamUiState<List<CostAlert>>> = repository.observeCostAlerts(currentUserId)
-        .map<List<CostAlert>, StreamUiState<List<CostAlert>>> { list ->
-            val sorted = list.sortedByDescending { it.createdAt?.seconds ?: 0L }
-            StreamUiState.Success(sorted)
-        }
-        .catch { error ->
-            emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load cost alerts")))
+    val costAlertsState: StateFlow<StreamUiState<List<CostAlert>>> = _repositoryFlow
+        .flatMapLatest { repo ->
+            val cloudUid = if (repo != null && isFirebaseInitialized()) {
+                runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+            } else null
+            if (repo != null && cloudUid != null) {
+                repo.observeCostAlerts(cloudUid)
+                    .map<List<CostAlert>, StreamUiState<List<CostAlert>>> { list ->
+                        val sorted = list.sortedByDescending { it.createdAt?.seconds ?: 0L }
+                        StreamUiState.Success(sorted)
+                    }
+                    .catch { error ->
+                        emit(StreamUiState.Error(unwrapFirestoreError(error, "Failed to load cost alerts")))
+                    }
+            } else {
+                _localCostAlerts.map { StreamUiState.Success(it) }
+            }
         }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = StreamUiState.Loading
+            initialValue = StreamUiState.Success(emptyList())
         )
 
     private val _aiState = MutableStateFlow<AiGenerationState>(AiGenerationState.Idle)
     val aiState: StateFlow<AiGenerationState> = _aiState.asStateFlow()
 
-    private val _inferenceTarget = MutableStateFlow(InferenceTarget.FIREBASE_GEMINI)
+    private val _inferenceTarget = MutableStateFlow(
+        if (isFirebaseInitialized()) InferenceTarget.FIREBASE_GEMINI else InferenceTarget.GC2223_GATEWAY
+    )
     val inferenceTarget: StateFlow<InferenceTarget> = _inferenceTarget.asStateFlow()
 
     private val _attachedSources = MutableStateFlow<List<AttachedSource>>(emptyList())
@@ -261,6 +349,24 @@ class HubViewModel(
     )
     val gcpWizardState: StateFlow<GcpWizardState> = _gcpWizardState.asStateFlow()
 
+    private val _connectorStatuses = MutableStateFlow<List<ConnectorStatus>>(emptyList())
+    val connectorStatuses: StateFlow<List<ConnectorStatus>> = _connectorStatuses.asStateFlow()
+
+    private val _mcpTools = MutableStateFlow<List<McpToolDefinition>>(emptyList())
+    val mcpTools: StateFlow<List<McpToolDefinition>> = _mcpTools.asStateFlow()
+
+    private val _gitHubDeviceChallenge = MutableStateFlow<GitHubDeviceCodeChallenge?>(null)
+    val gitHubDeviceChallenge: StateFlow<GitHubDeviceCodeChallenge?> = _gitHubDeviceChallenge.asStateFlow()
+
+    private val _gitHubOrganizations = MutableStateFlow<List<GitHubOrganizationSummary>>(emptyList())
+    val gitHubOrganizations: StateFlow<List<GitHubOrganizationSummary>> = _gitHubOrganizations.asStateFlow()
+
+    private val _gitHubDiscoveredRepos = MutableStateFlow<List<String>>(emptyList())
+    val gitHubDiscoveredRepos: StateFlow<List<String>> = _gitHubDiscoveredRepos.asStateFlow()
+
+    private val _lastMcpToolResult = MutableStateFlow<McpToolExecutionResult?>(null)
+    val lastMcpToolResult: StateFlow<McpToolExecutionResult?> = _lastMcpToolResult.asStateFlow()
+
     val syncSnapshotState: StateFlow<SyncStatusSnapshot> = syncSnapshotStore.observeSnapshot(currentUserId)
         .stateIn(
             scope = viewModelScope,
@@ -284,10 +390,12 @@ class HubViewModel(
 
     init {
         viewModelScope.launch {
-            repository.seedDefaultNodesIfEmpty(currentUserId, userEmail)
-                .onFailure { err -> Log.w(TAG, "Initial node seed failed", err) }
-            repository.seedDefaultCostConfigIfMissing(currentUserId, userEmail)
-                .onFailure { err -> Log.w(TAG, "Initial cost config seed failed", err) }
+            cloudRepoAndUid()?.let { (repo, cloudUid) ->
+                repo.seedDefaultNodesIfEmpty(cloudUid, userEmail)
+                    .onFailure { err -> Log.w(TAG, "Initial node seed failed", err) }
+                repo.seedDefaultCostConfigIfMissing(cloudUid, userEmail)
+                    .onFailure { err -> Log.w(TAG, "Initial cost config seed failed", err) }
+            }
         }
         val syncCfg = syncSnapshotStore.loadSettings(currentUserId)
         if (syncCfg.enabled) {
@@ -345,7 +453,103 @@ class HubViewModel(
         return rootError.message ?: fallback
     }
 
+    fun attachCloudRepository(cloudRepo: FirestoreRepository) {
+        _repositoryFlow.value = cloudRepo
+        viewModelScope.launch {
+            cloudRepoAndUid()?.let { (repo, cloudUid) ->
+                repo.seedDefaultNodesIfEmpty(cloudUid, userEmail)
+                    .onFailure { err -> Log.w(TAG, "On-demand node seed failed", err) }
+                repo.seedDefaultCostConfigIfMissing(cloudUid, userEmail)
+                    .onFailure { err -> Log.w(TAG, "On-demand cost config seed failed", err) }
+            }
+        }
+    }
+
+    private suspend fun persistNodeStatus(
+        nodeId: String,
+        status: String,
+        endpointOrTarget: String,
+        lastCheckedNote: String
+    ): Result<Unit> {
+        _localNodes.update { list ->
+            list.map { node ->
+                if (node.id == nodeId) {
+                    node.copy(
+                        status = status,
+                        endpointOrTarget = endpointOrTarget.take(200),
+                        lastCheckedNote = lastCheckedNote.take(300)
+                    )
+                } else node
+            }
+        }
+        val (repo, cloudUid) = cloudRepoAndUid() ?: return Result.success(Unit)
+        return repo.updateNodeStatus(cloudUid, nodeId, status, endpointOrTarget, lastCheckedNote)
+    }
+
+    private suspend fun persistCostEntry(
+        provider: String,
+        amountUsd: Double,
+        usageSummary: String,
+        source: String,
+        dateKey: String = FirestoreRepository.todayDateKey()
+    ): Result<String> {
+        val localEntry = CostEntry(
+            id = UUID.randomUUID().toString(),
+            userId = currentUserId,
+            provider = provider,
+            dateKey = dateKey,
+            amountUsd = amountUsd,
+            usageSummary = usageSummary,
+            source = source
+        )
+        _localCostEntries.update { listOf(localEntry) + it }
+        val (repo, cloudUid) = cloudRepoAndUid() ?: return Result.success(localEntry.id)
+        return repo.addCostEntry(cloudUid, provider, amountUsd, usageSummary, source, dateKey)
+    }
+
+    private suspend fun persistCostConfig(
+        alertEmail: String,
+        dailyThresholdUsd: Double,
+        autoEmailEnabled: Boolean,
+        webhookPath: String
+    ): Result<Unit> {
+        _localCostConfig.update {
+            it.copy(
+                alertEmail = alertEmail,
+                dailyThresholdUsd = dailyThresholdUsd,
+                autoEmailEnabled = autoEmailEnabled,
+                webhookPath = webhookPath
+            )
+        }
+        val (repo, cloudUid) = cloudRepoAndUid() ?: return Result.success(Unit)
+        return repo.updateCostConfig(cloudUid, alertEmail, dailyThresholdUsd, autoEmailEnabled, webhookPath)
+    }
+
+    private suspend fun persistCostAlert(
+        dateKey: String,
+        totalUsd: Double,
+        thresholdUsd: Double,
+        recipientEmail: String,
+        deliveryStatus: String,
+        deliveryDetail: String
+    ): Result<Unit> {
+        val localAlert = CostAlert(
+            id = UUID.randomUUID().toString(),
+            userId = currentUserId,
+            dateKey = dateKey,
+            totalUsd = totalUsd,
+            thresholdUsd = thresholdUsd,
+            recipientEmail = recipientEmail,
+            deliveryStatus = deliveryStatus,
+            deliveryDetail = deliveryDetail
+        )
+        _localCostAlerts.update { listOf(localAlert) + it }
+        val (repo, cloudUid) = cloudRepoAndUid() ?: return Result.success(Unit)
+        return repo.recordCostAlert(cloudUid, dateKey, totalUsd, thresholdUsd, recipientEmail, deliveryStatus, deliveryDetail)
+    }
+
     private suspend fun fetchFirebaseIdToken(): String? {
+        if (!isFirebaseInitialized()) return null
         return try {
             Firebase.auth.currentUser?.getIdToken(false)?.await()?.token
         } catch (e: CancellationException) {
@@ -525,8 +729,7 @@ class HubViewModel(
                     firebaseIdToken = idToken
                 )
                 if (res.success) {
-                    repository.addCostEntry(
-                        userId = currentUserId,
+                    persistCostEntry(
                         provider = "GITHUB",
                         amountUsd = 0.0,
                         usageSummary = "Terraform ${action.cliValue} ($targetEnv) on ${creds.githubOwnerRepo.ifBlank { "sso-default" }}",
@@ -613,8 +816,7 @@ class HubViewModel(
                 _statusBanner.value = res.summary
                 if (res.success) {
                     val tidSuffix = if (res.traceId.isNotBlank()) " [tid:${res.traceId}]" else ""
-                    repository.addCostEntry(
-                        userId = currentUserId,
+                    persistCostEntry(
                         provider = "CLOUDFLARE",
                         amountUsd = 0.0,
                         usageSummary = "Orchestrate ${routeTarget.address} (${taskType.taskId})$tidSuffix".take(195),
@@ -745,8 +947,7 @@ class HubViewModel(
                 )
                 _statusBanner.value = res.message
                 if (res.success) {
-                    repository.addCostEntry(
-                        userId = currentUserId,
+                    persistCostEntry(
                         provider = "CLOUDFLARE",
                         amountUsd = 0.0,
                         usageSummary = res.message.take(195),
@@ -1032,12 +1233,16 @@ class HubViewModel(
                     append(errorLog.take(6000))
                 }
 
-                val aiDiagnosis = runCatching {
-                    withTimeout(45_000L) {
-                        chatModel.generateContent(prompt).text.orEmpty()
+                val aiDiagnosis = if (!isFirebaseInitialized() && !RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)) {
+                    "Firebase 未初期化のため、ローカル / MCP ステータスのみ解析します。\n「状態 → GCP連携」からプロジェクトを連携すると Gemini 自己修復解析が有効になります。"
+                } else {
+                    runCatching {
+                        withTimeout(45_000L) {
+                            chatModel.generateContent(prompt).text.orEmpty()
+                        }
+                    }.getOrElse { err ->
+                        "Gemini 診断エラー: ${err.localizedMessage ?: "Timeout"}"
                     }
-                }.getOrElse { err ->
-                    "Gemini 診断エラー: ${err.localizedMessage ?: "Timeout"}"
                 }
 
                 val reportLines = mutableListOf<String>()
@@ -1292,6 +1497,12 @@ class HubViewModel(
 
     private fun generateStreamingReply(userPrompt: String, sources: List<AttachedSource>) {
         viewModelScope.launch {
+            if (!isFirebaseInitialized() && !RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)) {
+                _aiState.value = AiGenerationState.Error(
+                    "Firebase はまだオンデマンド初期化されていません。「状態 → GCP連携」でプロジェクトを選択するか、推論先を「gc2223.com MCP」に切り替えてください。"
+                )
+                return@launch
+            }
             _aiState.value = AiGenerationState.Loading
             val accumulated = StringBuilder()
             val contextualPrompt = buildString {
@@ -1331,8 +1542,7 @@ class HubViewModel(
                 if (accumulated.isNotBlank()) {
                     _aiState.value = AiGenerationState.Success(accumulated.toString())
                     val srcLabel = if (sources.isNotEmpty()) " + ${sources.size} sources" else ""
-                    repository.addCostEntry(
-                        userId = currentUserId,
+                    persistCostEntry(
                         provider = "FIREBASE",
                         amountUsd = 0.0,
                         usageSummary = "Gemini 3.8 Flash stream$srcLabel (${accumulated.length} chars, Spark Free)",
@@ -1355,13 +1565,19 @@ class HubViewModel(
 
     private fun generateStructuredPlan(userPrompt: String, sources: List<AttachedSource>) {
         viewModelScope.launch {
+            if (!isFirebaseInitialized() && !RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)) {
+                _aiState.value = AiGenerationState.Error(
+                    "Firebase はまだオンデマンド初期化されていません。「状態 → GCP連携」でプロジェクトを選択するか、推論先を「gc2223.com MCP」に切り替えてください。"
+                )
+                return@launch
+            }
             _aiState.value = AiGenerationState.Loading
             val prompt = buildString {
                 appendLine("Design a concrete zero-cost automation solution for:")
                 appendLine("Account: $userEmail")
                 appendLine("Cloudflare domain: ${_credentials.value.gc2223Endpoint}")
-                appendLine("GitHub repo: ${_credentials.value.githubOwnerRepo.ifBlank { "17crown1901mituru/OrchestraAntiGravity" }}")
-                appendLine("GCP project: ${_credentials.value.gcpProjectId.ifBlank { "gen-lang-client-0439741065" }}")
+                appendLine("GitHub repo: ${_credentials.value.githubOwnerRepo.ifBlank { "(not configured)" }}")
+                appendLine("GCP project: ${_credentials.value.gcpProjectId.ifBlank { "(not configured)" }}")
                 appendLine("Target CLI: Termux AntiGravityAgent")
                 if (sources.isNotEmpty()) {
                     appendLine("Synthesize the attached Markdown, PDF, image, and/or video sources into the steps and cliOrConfigSnippet.")
@@ -1412,8 +1628,7 @@ class HubViewModel(
                 }
                 _aiState.value = AiGenerationState.Success(formatted, structuredPlan = plan)
                 val srcLabel = if (sources.isNotEmpty()) " (${sources.size} sources)" else ""
-                repository.addCostEntry(
-                    userId = currentUserId,
+                persistCostEntry(
                     provider = "FIREBASE",
                     amountUsd = 0.0,
                     usageSummary = "Gemini 3.8 Flash JSON plan$srcLabel: ${plan.planTitle.take(50)}",
@@ -1460,8 +1675,7 @@ class HubViewModel(
             )
             if (result.success) {
                 _aiState.value = AiGenerationState.Success(result.message)
-                repository.addCostEntry(
-                    userId = currentUserId,
+                persistCostEntry(
                     provider = "CLOUDFLARE",
                     amountUsd = 0.0,
                     usageSummary = "gc2223.com /v1/chat (Workers AI Free)",
@@ -1487,8 +1701,7 @@ class HubViewModel(
                     firebaseIdToken = idToken
                 )
                 val newStatus = if (res.success) "ACTIVE" else "ERROR"
-                repository.updateNodeStatus(
-                    userId = currentUserId,
+                persistNodeStatus(
                     nodeId = node.id,
                     status = newStatus,
                     endpointOrTarget = creds.gc2223Endpoint,
@@ -1525,8 +1738,7 @@ class HubViewModel(
                     }
                     st to cfStatus.summaryMessage
                 }
-                repository.updateNodeStatus(
-                    userId = currentUserId,
+                persistNodeStatus(
                     nodeId = node.id,
                     status = newStatus,
                     endpointOrTarget = creds.gc2223Endpoint,
@@ -1572,16 +1784,14 @@ class HubViewModel(
                     (ghStatus.health == com.example.model.SyncHealthState.CONNECTED) to ghStatus.summaryMessage
                 }
                 val newStatus = if (ok) "ACTIVE" else "ERROR"
-                repository.updateNodeStatus(
-                    userId = currentUserId,
+                persistNodeStatus(
                     nodeId = node.id,
                     status = newStatus,
                     endpointOrTarget = targetRepoResolved,
                     lastCheckedNote = note
                 )
                 if (dispatch && ok) {
-                    repository.addCostEntry(
-                        userId = currentUserId,
+                    persistCostEntry(
                         provider = "GITHUB",
                         amountUsd = 0.0,
                         usageSummary = "workflow_dispatch: ${targetRepoResolved}",
@@ -1604,8 +1814,7 @@ class HubViewModel(
                 } else {
                     node.endpointOrTarget
                 }
-                repository.updateNodeStatus(
-                    userId = currentUserId,
+                persistNodeStatus(
                     nodeId = node.id,
                     status = newStatus,
                     endpointOrTarget = target,
@@ -1628,8 +1837,7 @@ class HubViewModel(
         webhookPath: String
     ) {
         viewModelScope.launch {
-            repository.updateCostConfig(
-                userId = currentUserId,
+            persistCostConfig(
                 alertEmail = alertEmail,
                 dailyThresholdUsd = dailyThresholdUsd,
                 autoEmailEnabled = autoEmailEnabled,
@@ -1649,8 +1857,7 @@ class HubViewModel(
     ) {
         viewModelScope.launch {
             val today = FirestoreRepository.todayDateKey()
-            val result = repository.addCostEntry(
-                userId = currentUserId,
+            val result = persistCostEntry(
                 provider = provider,
                 amountUsd = amountUsd,
                 usageSummary = usageSummary,
@@ -1702,8 +1909,7 @@ class HubViewModel(
         breakdown: Map<String, Double>
     ) {
         if (!config.autoEmailEnabled) {
-            repository.recordCostAlert(
-                userId = currentUserId,
+            persistCostAlert(
                 dateKey = dateKey,
                 totalUsd = totalUsd,
                 thresholdUsd = config.dailyThresholdUsd,
@@ -1730,8 +1936,7 @@ class HubViewModel(
         )
 
         val status = if (webhookRes.success) "SENT" else "FAILED"
-        repository.recordCostAlert(
-            userId = currentUserId,
+        persistCostAlert(
             dateKey = dateKey,
             totalUsd = totalUsd,
             thresholdUsd = config.dailyThresholdUsd,
@@ -1748,7 +1953,9 @@ class HubViewModel(
 
     fun deleteCostEntry(entryId: String) {
         viewModelScope.launch {
-            repository.deleteCostEntry(currentUserId, entryId)
+            _localCostEntries.update { list -> list.filterNot { it.id == entryId } }
+            val (repo, cloudUid) = cloudRepoAndUid() ?: return@launch
+            repo.deleteCostEntry(cloudUid, entryId)
                 .onFailure { err ->
                     _statusBanner.value = err.localizedMessage ?: "削除に失敗しました"
                 }
@@ -1764,8 +1971,24 @@ class HubViewModel(
         status: String = "READY"
     ) {
         viewModelScope.launch {
-            repository.saveBlueprint(
+            val localBp = AgentBlueprint(
+                id = UUID.randomUUID().toString(),
                 userId = currentUserId,
+                title = title,
+                category = category,
+                summary = summary,
+                content = content,
+                targetHost = targetHost,
+                status = status
+            )
+            _localBlueprints.update { listOf(localBp) + it }
+            val cloud = cloudRepoAndUid()
+            if (cloud == null) {
+                _statusBanner.value = "ブループリント「$title」を端末内に保存しました"
+                return@launch
+            }
+            cloud.first.saveBlueprint(
+                userId = cloud.second,
                 title = title,
                 category = category,
                 summary = summary,
@@ -1782,7 +2005,14 @@ class HubViewModel(
 
     fun updateBlueprintStatus(blueprintId: String, newStatus: String) {
         viewModelScope.launch {
-            repository.updateBlueprintStatus(currentUserId, blueprintId, newStatus)
+            _localBlueprints.update { list ->
+                list.map { if (it.id == blueprintId) it.copy(status = newStatus) else it }
+            }
+            val (repo, cloudUid) = cloudRepoAndUid() ?: run {
+                _statusBanner.value = "ステータスを $newStatus に更新しました"
+                return@launch
+            }
+            repo.updateBlueprintStatus(cloudUid, blueprintId, newStatus)
                 .onSuccess {
                     _statusBanner.value = "ステータスを $newStatus に更新しました"
                 }
@@ -1794,7 +2024,12 @@ class HubViewModel(
 
     fun deleteBlueprint(blueprintId: String) {
         viewModelScope.launch {
-            repository.deleteBlueprint(currentUserId, blueprintId)
+            _localBlueprints.update { list -> list.filterNot { it.id == blueprintId } }
+            val (repo, cloudUid) = cloudRepoAndUid() ?: run {
+                _statusBanner.value = "ブループリントを削除しました"
+                return@launch
+            }
+            repo.deleteBlueprint(cloudUid, blueprintId)
                 .onSuccess {
                     _statusBanner.value = "ブループリントを削除しました"
                 }
@@ -1804,21 +2039,35 @@ class HubViewModel(
         }
     }
 
+    private fun currentConnectorContext(): ConnectorContext {
+        val oauthSession = InMemoryOAuthSessionStore.currentSession
+        return ConnectorContext(
+            googleSub = currentUserId,
+            virtualAlias = userEmail,
+            oauthAccessToken = _gcpWizardState.value.accessToken
+                .ifBlank { oauthSession?.accessToken.orEmpty() },
+            gcpProjectId = _gcpWizardState.value.selectedProjectId
+                .ifBlank { _credentials.value.gcpProjectId },
+            googleIdToken = oauthSession?.idToken.orEmpty()
+        )
+    }
+
     fun onGcpOAuthTokenAcquired(token: String) {
         val cleanToken = token.trim()
         if (cleanToken.isBlank()) {
             onGcpOAuthFailed("GCP OAuth Access Token が空です")
             return
         }
+        InMemoryOAuthSessionStore.accessToken = cleanToken
         _gcpWizardState.update {
             it.copy(
                 accessToken = cleanToken,
                 oauthAuthorized = true,
                 errorMessage = null,
-                statusMessage = "Google OAuth (cloud-platform) を承認しました。GCP プロジェクトを読み込んでいます..."
+                statusMessage = "Google OAuth を承認しました。アカウント・所属組織リソースを自動スキャンしています..."
             )
         }
-        loadGcpProjectsAndBilling()
+        discoverAccountResources()
     }
 
     fun onGcpOAuthFailed(message: String) {
@@ -1832,7 +2081,12 @@ class HubViewModel(
     }
 
     fun loadGcpProjectsAndBilling() {
+        discoverAccountResources()
+    }
+
+    fun discoverAccountResources() {
         val token = _gcpWizardState.value.accessToken
+            .ifBlank { InMemoryOAuthSessionStore.accessToken }
         if (token.isBlank()) {
             _gcpWizardState.update {
                 it.copy(errorMessage = "先に Step 1 で Google OAuth (cloud-platform) を承認してください")
@@ -1840,40 +2094,55 @@ class HubViewModel(
             return
         }
         viewModelScope.launch {
-            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            _gcpWizardState.update {
+                it.copy(
+                    isBusy = true,
+                    oauthAuthorized = true,
+                    accessToken = token,
+                    errorMessage = null,
+                    statusMessage = "アカウント・所属組織・GCP・Gemini モデルを自動ディスカバリー中..."
+                )
+            }
             try {
-                val projectsRes = gcpClient.listProjects(token)
-                val billingRes = gcpClient.listBillingAccounts(token)
-
-                projectsRes.onFailure { err ->
+                val currentSelection = _gcpWizardState.value.selectedProjectId
+                    .ifBlank { _credentials.value.gcpProjectId }
+                val res = gcpClient.discoverAccountResources(
+                    accessToken = token,
+                    preferredProjectId = currentSelection,
+                    apiKey = _credentials.value.gcpApiKeyOrToken
+                )
+                res.onFailure { err ->
                     _gcpWizardState.update {
                         it.copy(
                             isBusy = false,
-                            errorMessage = err.localizedMessage ?: "GCP プロジェクト一覧の取得に失敗しました"
+                            errorMessage = err.localizedMessage ?: "アカウントリソースの自動ディスカバリーに失敗しました"
                         )
                     }
                     return@launch
                 }
 
-                val projects = projectsRes.getOrDefault(emptyList())
-                val billingAccounts = billingRes.getOrDefault(emptyList())
-                val currentSelection = _gcpWizardState.value.selectedProjectId.ifBlank {
-                    _credentials.value.gcpProjectId
-                }
+                val discovery = res.getOrThrow()
                 val resolvedSelection = when {
-                    projects.any { it.projectId == currentSelection } -> currentSelection
-                    currentSelection.isNotBlank() && projects.isEmpty() -> currentSelection
-                    projects.isNotEmpty() -> projects.first().projectId
+                    discovery.projects.any { it.projectId == currentSelection } -> currentSelection
+                    currentSelection.isNotBlank() && discovery.projects.isEmpty() -> currentSelection
+                    discovery.projects.isNotEmpty() -> discovery.projects.first().projectId
                     else -> currentSelection
                 }
+                val detectedModel = discovery.geminiModels.firstOrNull()?.modelId
+                    ?: _gcpWizardState.value.selectedGeminiModel
 
                 _gcpWizardState.update {
                     it.copy(
                         isBusy = false,
-                        projects = projects,
-                        billingAccounts = billingAccounts,
+                        organizations = discovery.organizations,
+                        projects = discovery.projects,
+                        billingAccounts = discovery.billingAccounts,
+                        geminiModels = discovery.geminiModels,
                         selectedProjectId = resolvedSelection,
-                        statusMessage = "${projects.size} 件の GCP プロジェクトを取得しました",
+                        selectedGeminiModel = detectedModel,
+                        discoveryCompleted = true,
+                        discoverySummary = discovery.discoveryNote,
+                        statusMessage = "自動検出完了: ${discovery.discoveryNote}",
                         errorMessage = null
                     )
                 }
@@ -1881,20 +2150,59 @@ class HubViewModel(
                 if (resolvedSelection.isNotBlank()) {
                     refreshEnabledGcpApisInternal(token, resolvedSelection)
                 }
+                refreshAllConnectors()
             } finally {
                 _gcpWizardState.update { it.copy(isBusy = false) }
             }
         }
     }
 
+    fun selectOrganizationFilter(orgId: String) {
+        val cleanOrg = orgId.trim()
+        _gcpWizardState.update { state ->
+            val filtered = if (cleanOrg.isBlank()) {
+                state.projects
+            } else {
+                state.projects.filter { it.parentType == "organization" && it.parentId == cleanOrg }
+            }
+            val nextProj = if (filtered.isNotEmpty() && filtered.none { it.projectId == state.selectedProjectId }) {
+                filtered.first().projectId
+            } else {
+                state.selectedProjectId
+            }
+            state.copy(
+                selectedOrganizationId = cleanOrg,
+                selectedProjectId = nextProj,
+                statusMessage = if (cleanOrg.isBlank()) {
+                    "全組織・個人プロジェクト (${state.projects.size}件)"
+                } else {
+                    "組織 $cleanOrg でフィルタ (${filtered.size}件)"
+                }
+            )
+        }
+    }
+
+    fun selectGeminiModel(modelId: String) {
+        val cleanModel = modelId.trim()
+        if (cleanModel.isBlank()) return
+        _gcpWizardState.update {
+            it.copy(
+                selectedGeminiModel = cleanModel,
+                statusMessage = "使用 Gemini モデルを $cleanModel に設定しました"
+            )
+        }
+        _statusBanner.value = "Gemini モデル設定: $cleanModel"
+    }
+
     fun selectGcpProject(projectId: String) {
         val cleanId = projectId.trim()
         if (cleanId.isBlank()) return
+        InMemoryOAuthSessionStore.selectedGcpProjectId = cleanId
         val updatedCreds = _credentials.value.copy(gcpProjectId = cleanId)
         _credentials.value = updatedCreds
-        if (_vaultMetadata.value.hasStoredSecrets) {
-            secretsStore.saveForUser(currentUserId, userEmail, updatedCreds)
-        }
+        secretsStore.saveForUser(currentUserId, userEmail, updatedCreds)
+        _vaultMetadata.value = secretsStore.getVaultMetadata(currentUserId, userEmail)
+
         _gcpWizardState.update {
             it.copy(
                 selectedProjectId = cleanId,
@@ -1903,9 +2211,223 @@ class HubViewModel(
             )
         }
         val token = _gcpWizardState.value.accessToken
+            .ifBlank { InMemoryOAuthSessionStore.accessToken }
         if (token.isNotBlank()) {
             viewModelScope.launch {
                 refreshEnabledGcpApisInternal(token, cleanId)
+                gcpClient.listAvailableGeminiModels(token, cleanId, updatedCreds.gcpApiKeyOrToken)
+                    .onSuccess { models ->
+                        if (models.isNotEmpty()) {
+                            _gcpWizardState.update {
+                                it.copy(
+                                    geminiModels = models,
+                                    selectedGeminiModel = models.first().modelId
+                                )
+                            }
+                        }
+                    }
+            }
+        }
+    }
+
+    fun refreshAllConnectors() {
+        viewModelScope.launch {
+            val ctx = currentConnectorContext()
+            val creds = _credentials.value
+            val statuses = connectorRegistry.refreshAllStatuses(ctx, creds)
+            val tools = connectorRegistry.collectAllTools(ctx, creds)
+            _connectorStatuses.value = statuses
+            _mcpTools.value = tools
+        }
+    }
+
+    fun startGitHubDeviceFlow(clientId: String) {
+        val cleanClientId = clientId.trim()
+        val updatedCreds = _credentials.value.copy(githubOAuthClientId = cleanClientId)
+        _credentials.value = updatedCreds
+        secretsStore.saveForUser(currentUserId, userEmail, updatedCreds)
+        _vaultMetadata.value = secretsStore.getVaultMetadata(currentUserId, userEmail)
+
+        viewModelScope.launch {
+            _gcpWizardState.update { it.copy(isBusy = true, errorMessage = null) }
+            connectorRegistry.gitHubConnector.startDeviceFlow(cleanClientId)
+                .onSuccess { challenge ->
+                    _gitHubDeviceChallenge.value = challenge
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "GitHub コード ${challenge.userCode} を ${challenge.verificationUri} で承認してください"
+                        )
+                    }
+                    _statusBanner.value = "GitHub デバイスコード発行: ${challenge.userCode}"
+                }
+                .onFailure { err ->
+                    _gcpWizardState.update {
+                        it.copy(isBusy = false, errorMessage = err.localizedMessage ?: "GitHub Device Flow 開始に失敗しました")
+                    }
+                }
+        }
+    }
+
+    fun completeGitHubDeviceFlowPolling() {
+        val challenge = _gitHubDeviceChallenge.value ?: return
+        val clientId = _credentials.value.githubOAuthClientId.trim()
+        if (clientId.isBlank()) return
+
+        viewModelScope.launch {
+            _gcpWizardState.update {
+                it.copy(isBusy = true, errorMessage = null, statusMessage = "GitHub ブラウザ承認を確認中...")
+            }
+            try {
+                connectorRegistry.gitHubConnector.pollDeviceFlowToken(
+                    clientId = clientId,
+                    deviceCode = challenge.deviceCode,
+                    intervalSec = challenge.intervalSec,
+                    maxAttempts = 12
+                ).onSuccess { oauthToken ->
+                    val summary = connectorRegistry.gitHubConnector
+                        .fetchUserAndOrgs(oauthToken, _credentials.value.githubSelectedOrg)
+                        .getOrNull()
+                    val firstRepo = summary?.repos?.firstOrNull()?.fullName.orEmpty()
+                    val nextCreds = _credentials.value.copy(
+                        githubPat = oauthToken,
+                        githubAccountLogin = summary?.login.orEmpty(),
+                        githubOwnerRepo = _credentials.value.githubOwnerRepo.ifBlank { firstRepo }
+                    )
+                    saveCredentials(nextCreds)
+                    _gitHubDeviceChallenge.value = null
+                    _gitHubOrganizations.value = summary?.organizations.orEmpty()
+                    _gitHubDiscoveredRepos.value = summary?.repos?.map { it.fullName }.orEmpty()
+                    _gcpWizardState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "GitHub (@${summary?.login ?: "OAuth"}) 連携完了: Org ${summary?.organizations?.size ?: 0}件 / Repo ${summary?.repos?.size ?: 0}件"
+                        )
+                    }
+                    refreshAllConnectors()
+                }.onFailure { err ->
+                    _gcpWizardState.update {
+                        it.copy(isBusy = false, errorMessage = err.localizedMessage ?: "GitHub 承認確認に失敗しました")
+                    }
+                }
+            } finally {
+                _gcpWizardState.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    fun selectGitHubOrganization(orgLogin: String) {
+        val cleanOrg = orgLogin.trim()
+        val updated = _credentials.value.copy(githubSelectedOrg = cleanOrg)
+        saveCredentials(updated)
+        val token = updated.githubPat.trim()
+        if (token.isNotBlank()) {
+            viewModelScope.launch {
+                connectorRegistry.gitHubConnector.fetchUserAndOrgs(token, cleanOrg)
+                    .onSuccess { summary ->
+                        _gitHubOrganizations.value = summary.organizations
+                        _gitHubDiscoveredRepos.value = summary.repos.map { it.fullName }
+                        if (summary.repos.isNotEmpty() && updated.githubOwnerRepo.isBlank()) {
+                            saveCredentials(updated.copy(githubOwnerRepo = summary.repos.first().fullName))
+                        }
+                        _statusBanner.value = if (cleanOrg.isBlank()) {
+                            "GitHub 全リポジトリ (${summary.repos.size}件)"
+                        } else {
+                            "GitHub Org '$cleanOrg' (${summary.repos.size} repos)"
+                        }
+                    }
+            }
+        }
+    }
+
+    fun selectGitHubRepository(ownerRepo: String) {
+        val cleanRepo = ownerRepo.trim()
+        if (cleanRepo.isBlank()) return
+        saveCredentials(_credentials.value.copy(githubOwnerRepo = cleanRepo))
+        _statusBanner.value = "GitHub 連携リポジトリを選択: $cleanRepo"
+    }
+
+    fun addCustomMcpEndpoint(label: String, url: String, bearerToken: String = "") {
+        val cleanUrl = url.trim().trimEnd('/')
+        if (cleanUrl.isBlank()) return
+        val cleanLabel = label.trim().ifBlank { cleanUrl.removePrefix("https://").removePrefix("http://") }
+        val newEntry = com.example.model.McpEndpointEntry(
+            id = "mcp_${System.currentTimeMillis()}",
+            label = cleanLabel,
+            url = cleanUrl,
+            bearerToken = bearerToken.trim(),
+            isActive = true
+        )
+        val updatedList = _credentials.value.mcpEndpoints
+            .filterNot { it.url == cleanUrl }
+            .map { it.copy(isActive = false) } + newEntry
+        val updatedCreds = _credentials.value.copy(
+            gc2223Endpoint = cleanUrl,
+            gc2223BearerToken = bearerToken.trim().ifBlank { _credentials.value.gc2223BearerToken },
+            mcpEndpoints = updatedList
+        )
+        saveCredentials(updatedCreds)
+        refreshAllConnectors()
+    }
+
+    fun switchActiveMcpEndpoint(endpointId: String) {
+        val currentList = _credentials.value.mcpEndpoints
+        val target = currentList.firstOrNull { it.id == endpointId } ?: return
+        val updatedList = currentList.map { it.copy(isActive = it.id == endpointId) }
+        val updatedCreds = _credentials.value.copy(
+            gc2223Endpoint = target.url,
+            gc2223BearerToken = target.bearerToken.ifBlank { _credentials.value.gc2223BearerToken },
+            mcpEndpoints = updatedList
+        )
+        saveCredentials(updatedCreds)
+        refreshAllConnectors()
+    }
+
+    fun removeCustomMcpEndpoint(endpointId: String) {
+        val currentList = _credentials.value.mcpEndpoints
+        if (currentList.size <= 1) return
+        val filtered = currentList.filterNot { it.id == endpointId }
+        val normalized = if (filtered.none { it.isActive }) {
+            filtered.mapIndexed { idx, item -> item.copy(isActive = idx == 0) }
+        } else {
+            filtered
+        }
+        val active = normalized.first { it.isActive }
+        saveCredentials(
+            _credentials.value.copy(
+                gc2223Endpoint = active.url,
+                mcpEndpoints = normalized
+            )
+        )
+        refreshAllConnectors()
+    }
+
+    fun executeMcpTool(toolName: String, argumentsJson: JSONObject = JSONObject()) {
+        viewModelScope.launch {
+            _isBusyNodeAction.value = true
+            try {
+                val ctx = currentConnectorContext()
+                val creds = _credentials.value
+                val provider = when {
+                    toolName.startsWith("github_") -> connectorRegistry.gitHubConnector
+                    toolName.startsWith("termux_") -> connectorRegistry.termuxConnector
+                    else -> connectorRegistry.remoteMcpConnector
+                }
+                provider.callTool(ctx, creds, toolName, argumentsJson)
+                    .onSuccess { res ->
+                        _lastMcpToolResult.value = res
+                        _statusBanner.value = "MCP ツール '$toolName': ${if (res.ok) "成功" else "エラー"}"
+                    }
+                    .onFailure { err ->
+                        _lastMcpToolResult.value = McpToolExecutionResult(
+                            ok = false,
+                            toolName = toolName,
+                            output = err.localizedMessage ?: "MCP 実行失敗"
+                        )
+                        _statusBanner.value = err.localizedMessage ?: "MCP 実行に失敗しました"
+                    }
+            } finally {
+                _isBusyNodeAction.value = false
             }
         }
     }
@@ -2097,6 +2619,28 @@ class HubViewModel(
                     bootstrapStore.save(mergedBootstrap)
                     val updatedCreds = creds.copy(gcpProjectId = syncRes.projectId)
                     saveCredentials(updatedCreds)
+
+                    // On-demand initialization of Firebase, App Check & Firestore after user selects GCP project
+                    val fbInitialized = RuntimeCloudBootstrapStore.ensureFirebaseInitialized(applicationContext)
+                    if (fbInitialized) {
+                        configureAppCheck(applicationContext, null)
+                        val fbAuth = runCatching { Firebase.auth }.getOrNull()
+                        val sessionIdToken = InMemoryOAuthSessionStore.currentSession?.idToken.orEmpty()
+                        if (fbAuth != null && fbAuth.currentUser == null && sessionIdToken.isNotBlank()) {
+                            runCatching {
+                                fbAuth.signInWithCredential(GoogleAuthProvider.getCredential(sessionIdToken, null)).await()
+                            }.onFailure { Log.w(TAG, "Optional Firebase Auth sign-in skipped", it) }
+                        }
+                        if (fbAuth?.currentUser != null) {
+                            runCatching {
+                                val dbId = RuntimeCloudBootstrapStore.resolveDatabaseId(applicationContext)
+                                val db = FirebaseFirestore.getInstance(dbId)
+                                attachCloudRepository(FirestoreRepository(db, fbAuth))
+                            }.onFailure { Log.w(TAG, "Optional Firestore attach skipped", it) }
+                        }
+                        onFirebaseProvisioned()
+                    }
+
                     _gcpWizardState.update {
                         it.copy(
                             isBusy = false,
@@ -2104,11 +2648,11 @@ class HubViewModel(
                             lastFirebaseAppId = syncRes.androidAppId,
                             registeredShaCount = syncRes.registeredShaCount,
                             signingDiagnostics = diag,
-                            statusMessage = "Firebase Android App (${syncRes.androidAppId}) と署名 SHA (${syncRes.registeredShaCount}件) を同期しました",
+                            statusMessage = "Firebase (${syncRes.androidAppId}) と App Check をオンデマンド初期化し、署名 SHA (${syncRes.registeredShaCount}件) を同期しました",
                             errorMessage = null
                         )
                     }
-                    _statusBanner.value = "Firebase 構成・APK 署名 SHA 証明書を同期しました"
+                    _statusBanner.value = "Firebase / Firestore / App Check をオンデマンド初期化しました"
                 }.onFailure { err ->
                     _gcpWizardState.update {
                         it.copy(
@@ -2176,7 +2720,7 @@ class HubViewModel(
                             } else {
                                 "Project: $effectiveProject"
                             }
-                            repository.updateNodeStatus(currentUserId, node.id, st, effectiveProject, note)
+                            persistNodeStatus(node.id, st, effectiveProject, note)
                         }
                         "FIREBASE" -> {
                             val st = if (wiz.firebaseSynced) "ACTIVE" else node.status
@@ -2185,7 +2729,7 @@ class HubViewModel(
                             } else {
                                 node.lastCheckedNote
                             }
-                            repository.updateNodeStatus(currentUserId, node.id, st, effectiveProject, note)
+                            persistNodeStatus(node.id, st, effectiveProject, note)
                         }
                         "CLOUDFLARE" -> {
                             val gwRes = bridgeClient.pingGc2223Gateway(
@@ -2193,8 +2737,7 @@ class HubViewModel(
                                 bearerToken = updatedCreds.gc2223BearerToken,
                                 firebaseIdToken = idToken
                             )
-                            repository.updateNodeStatus(
-                                currentUserId,
+                            persistNodeStatus(
                                 node.id,
                                 if (gwRes.success) "ACTIVE" else "CONFIGURED",
                                 updatedCreds.gc2223Endpoint,
@@ -2215,8 +2758,7 @@ class HubViewModel(
                                 com.example.model.SyncHealthState.ERROR -> "ERROR"
                                 else -> "CONFIGURED"
                             }
-                            repository.updateNodeStatus(
-                                currentUserId,
+                            persistNodeStatus(
                                 node.id,
                                 st,
                                 updatedCreds.githubOwnerRepo.ifBlank { node.endpointOrTarget },
@@ -2229,8 +2771,7 @@ class HubViewModel(
                                 updatedCreds.termuxAgentToken
                             )
                             val st = if (tmStatus.health == com.example.model.SyncHealthState.CONNECTED) "ACTIVE" else "CONFIGURED"
-                            repository.updateNodeStatus(
-                                currentUserId,
+                            persistNodeStatus(
                                 node.id,
                                 st,
                                 updatedCreds.termuxAgentUrl,
@@ -2253,6 +2794,69 @@ class HubViewModel(
             } finally {
                 _gcpWizardState.update { it.copy(isBusy = false) }
             }
+        }
+    }
+
+    private companion object {
+        fun buildDefaultLocalNodes(userId: String, accountHint: String): List<WorkflowNode> {
+            val hint = accountHint.ifBlank { "google-oauth" }.take(120)
+            return listOf(
+                WorkflowNode(
+                    id = "cloudflare_gc2223",
+                    userId = userId,
+                    provider = "CLOUDFLARE",
+                    title = "gc2223.com Stateless MCP Gateway",
+                    endpointOrTarget = "https://gc2223.com",
+                    accountHint = hint,
+                    status = "CONFIGURED",
+                    monthlyFreeQuota = "Workers 100k req/day + Workers AI Free",
+                    lastCheckedNote = "Stateless MCP mode ready (zero PII on edge)"
+                ),
+                WorkflowNode(
+                    id = "termux_antigravity",
+                    userId = userId,
+                    provider = "TERMUX",
+                    title = "Termux AntiGravityAgent CLI",
+                    endpointOrTarget = "http://127.0.0.1:8787",
+                    accountHint = "Android Termux Shell",
+                    status = "CONFIGURED",
+                    monthlyFreeQuota = "Local CLI (0 cost)",
+                    lastCheckedNote = "Local shell & MCP bridge ready"
+                ),
+                WorkflowNode(
+                    id = "github_actions",
+                    userId = userId,
+                    provider = "GITHUB",
+                    title = "GitHub Actions CI/CD Runner",
+                    endpointOrTarget = "workflow_dispatch -> deploy-gc2223.yml",
+                    accountHint = hint,
+                    status = "CONFIGURED",
+                    monthlyFreeQuota = "Public Free / Private 2,000 min/mo",
+                    lastCheckedNote = "Set GitHub PAT & repo in local AES vault"
+                ),
+                WorkflowNode(
+                    id = "gcp_free_tier",
+                    userId = userId,
+                    provider = "GCP",
+                    title = "GCP Always Free + Budget Guard",
+                    endpointOrTarget = "(Select in GCP Wizard)",
+                    accountHint = hint,
+                    status = "CONFIGURED",
+                    monthlyFreeQuota = "Always Free + $0.10/day Guard",
+                    lastCheckedNote = "Auto-discover projects via Google OAuth"
+                ),
+                WorkflowNode(
+                    id = "firebase_ai_logic",
+                    userId = userId,
+                    provider = "FIREBASE",
+                    title = "Firebase AI Logic + Firestore (On-Demand)",
+                    endpointOrTarget = "gemini-3.8-flash",
+                    accountHint = hint,
+                    status = "CONFIGURED",
+                    monthlyFreeQuota = "Spark Free / On-Demand Init",
+                    lastCheckedNote = "Initialized when GCP project is linked"
+                )
+            )
         }
     }
 }

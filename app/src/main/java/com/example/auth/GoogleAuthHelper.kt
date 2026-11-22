@@ -3,6 +3,7 @@ package com.example.auth
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.util.Base64
 import android.util.Log
 import androidx.activity.result.IntentSenderRequest
 import androidx.credentials.ClearCredentialStateRequest
@@ -20,14 +21,20 @@ import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.security.MessageDigest
 
 private const val TAG = "GoogleAuthHelper"
 const val GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -35,7 +42,57 @@ private const val SCOPE_OPENID = "openid"
 private const val SCOPE_EMAIL = "https://www.googleapis.com/auth/userinfo.email"
 private const val SCOPE_PROFILE = "https://www.googleapis.com/auth/userinfo.profile"
 
+data class GoogleAccountSession(
+    val sub: String,
+    val virtualAlias: String,
+    val accessToken: String = "",
+    val email: String = "",
+    val idToken: String = ""
+) {
+    val isValid: Boolean
+        get() = sub.isNotBlank() && (accessToken.isNotBlank() || idToken.isNotBlank())
+
+    companion object {
+        fun buildVirtualAlias(sub: String): String {
+            val hexPrefix = sha256Hex(sub.trim()).take(12)
+            return "u-$hexPrefix@gc2223.com"
+        }
+
+        fun deriveFallbackSub(seed: String): String {
+            return "oauth-${sha256Hex(seed.trim()).take(20)}"
+        }
+
+        fun create(
+            sub: String,
+            accessToken: String = "",
+            email: String = "",
+            idToken: String = ""
+        ): GoogleAccountSession {
+            val cleanSub = sub.trim()
+            return GoogleAccountSession(
+                sub = cleanSub,
+                virtualAlias = buildVirtualAlias(cleanSub),
+                accessToken = accessToken.trim(),
+                email = email.trim(),
+                idToken = idToken.trim()
+            )
+        }
+
+        private fun sha256Hex(input: String): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(input.toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+    }
+}
+
 object InMemoryOAuthSessionStore {
+    private val _sessionFlow = MutableStateFlow<GoogleAccountSession?>(null)
+    val sessionFlow: StateFlow<GoogleAccountSession?> = _sessionFlow.asStateFlow()
+
+    val currentSession: GoogleAccountSession?
+        get() = _sessionFlow.value
+
     @Volatile
     var accessToken: String = ""
     @Volatile
@@ -43,11 +100,32 @@ object InMemoryOAuthSessionStore {
     @Volatile
     var selectedGcpProjectId: String = ""
 
+    fun setSession(session: GoogleAccountSession) {
+        _sessionFlow.value = session
+        if (session.accessToken.isNotBlank()) {
+            accessToken = session.accessToken
+        }
+        userEmail = session.email.ifBlank { session.virtualAlias }
+    }
+
     fun clear() {
+        _sessionFlow.value = null
         accessToken = ""
         userEmail = ""
         selectedGcpProjectId = ""
     }
+}
+
+internal fun extractGoogleJwtClaims(idToken: String): Pair<String, String>? {
+    return runCatching {
+        val parts = idToken.trim().split('.')
+        if (parts.size < 2) return@runCatching null
+        val payloadBytes = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        val json = JSONObject(String(payloadBytes, Charsets.UTF_8))
+        val sub = json.optString("sub", "").trim()
+        val email = json.optString("email", "").trim()
+        if (sub.isBlank()) null else (sub to email)
+    }.getOrNull()
 }
 
 fun attemptAutoSignIn(
@@ -57,12 +135,22 @@ fun attemptAutoSignIn(
     onUnauthenticated: () -> Unit,
     scope: CoroutineScope
 ) {
-    val auth = runCatching { Firebase.auth }.getOrNull()
-    if (auth == null) {
-        onUnauthenticated()
+    val existingSession = InMemoryOAuthSessionStore.currentSession
+    if (existingSession?.isValid == true) {
+        onAuthSuccess()
         return
     }
-    if (auth.currentUser != null) {
+    val firebaseReady = FirebaseApp.getApps(context).isNotEmpty()
+    val auth = if (firebaseReady) runCatching { Firebase.auth }.getOrNull() else null
+    if (auth?.currentUser != null) {
+        val fbUser = auth.currentUser!!
+        InMemoryOAuthSessionStore.setSession(
+            GoogleAccountSession.create(
+                sub = fbUser.uid,
+                accessToken = InMemoryOAuthSessionStore.accessToken,
+                email = fbUser.email.orEmpty()
+            )
+        )
         onAuthSuccess()
         return
     }
@@ -86,8 +174,21 @@ fun attemptAutoSignIn(
         try {
             val cred = credentialManager.getCredential(context, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                val idToken = GoogleIdTokenCredential.createFrom(cred.data).idToken
+                val claims = extractGoogleJwtClaims(idToken)
+                if (auth != null) {
+                    auth.signInWithCredential(GoogleAuthProvider.getCredential(idToken, null)).await()
+                }
+                val sub = claims?.first ?: auth?.currentUser?.uid ?: GoogleAccountSession.deriveFallbackSub(idToken)
+                val email = claims?.second.orEmpty().ifBlank { auth?.currentUser?.email.orEmpty() }
+                InMemoryOAuthSessionStore.setSession(
+                    GoogleAccountSession.create(
+                        sub = sub,
+                        accessToken = InMemoryOAuthSessionStore.accessToken,
+                        email = email,
+                        idToken = idToken
+                    )
+                )
                 onAuthSuccess()
             } else {
                 onUnauthenticated()
@@ -110,7 +211,7 @@ fun onGoogleSignInClicked(
 ) {
     val clientId = resolveDefaultWebClientId(context)
     if (clientId == null) {
-        onAuthError("有効な Web Client ID (default_web_client_id) が設定されていません。接続設定または google-services.json を確認してください。")
+        onAuthError("有効な Web Client ID が未設定です。Google OAuth フローでログインしてください。")
         return
     }
 
@@ -125,10 +226,23 @@ fun onGoogleSignInClicked(
                 ?: throw IllegalStateException("Google Sign-In requires an Activity context.")
             val cred = credentialManager.getCredential(activity, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                val auth = runCatching { Firebase.auth }.getOrNull()
-                    ?: throw IllegalStateException("FirebaseAuth is not initialized.")
-                auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                val idToken = GoogleIdTokenCredential.createFrom(cred.data).idToken
+                val claims = extractGoogleJwtClaims(idToken)
+                val auth = if (FirebaseApp.getApps(context).isNotEmpty()) {
+                    runCatching { Firebase.auth }.getOrNull()
+                } else null
+                auth?.signInWithCredential(GoogleAuthProvider.getCredential(idToken, null))?.await()
+
+                val sub = claims?.first ?: auth?.currentUser?.uid ?: GoogleAccountSession.deriveFallbackSub(idToken)
+                val email = claims?.second.orEmpty().ifBlank { auth?.currentUser?.email.orEmpty() }
+                InMemoryOAuthSessionStore.setSession(
+                    GoogleAccountSession.create(
+                        sub = sub,
+                        accessToken = InMemoryOAuthSessionStore.accessToken,
+                        email = email,
+                        idToken = idToken
+                    )
+                )
                 onAuthSuccess()
             } else {
                 onAuthError("Unexpected credential type received.")
@@ -157,6 +271,7 @@ fun signOutUser(
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to clear credential state: ${e.message}")
             } finally {
+                InMemoryOAuthSessionStore.clear()
                 runCatching { Firebase.auth.signOut() }
                 onSignOutComplete()
             }

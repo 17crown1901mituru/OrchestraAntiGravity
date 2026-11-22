@@ -221,7 +221,7 @@ fun SettingsScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "Firebase Auth 連携暗号化ボルト",
+                                    text = "Google OAuth (sub) 隔離暗号化ボルト",
                                     style = MaterialTheme.typography.titleMedium
                                 )
                             }
@@ -247,11 +247,11 @@ fun SettingsScreen(
                         }
 
                         Text(
-                            text = "アカウント: ${vaultMetadata.linkedEmail.ifBlank { userEmail.ifBlank { "Google Account" } }}",
+                            text = "仮想アカウント: ${vaultMetadata.linkedEmail.ifBlank { userEmail.ifBlank { "Google Account" } }}",
                             style = MaterialTheme.typography.bodyMedium
                         )
                         Text(
-                            text = "Firebase UID: ${vaultMetadata.linkedUid.ifBlank { "-" }}",
+                            text = "Google Sub (不変ID): ${vaultMetadata.linkedUid.ifBlank { "-" }}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -261,7 +261,7 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.secondary
                         )
                         Text(
-                            text = "Cloudflare Worker (Google SSO ブローカー) が有効な場合、GitHub PAT や Cloudflare API Token は端末未入力のままでも Google ログインだけで各ワークフローを実行できます。ローカル上書きトークンを保存する場合は Android Keystore 鍵で AES-256-GCM 暗号化されます。",
+                            text = "gc2223.com は個人情報を保持しないステートレス MCP サーバーとして動作します。GitHub OAuth・MCP エンドポイント・Termux トークンは Google Sub ごとに端末内 Android Keystore 鍵で AES-256-GCM 隔離保存されます。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

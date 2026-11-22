@@ -23,6 +23,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.example.auth.GoogleAccountSession
+import com.example.auth.InMemoryOAuthSessionStore
 import com.example.data.CloudBridgeClient
 import com.example.data.FirestoreRepository
 import com.example.data.LocalSecretsStore
@@ -51,9 +53,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // App Check MUST run before setContent, ViewModels, or any Firebase call when configured
-        configureAppCheck(this, intent)
-
+        // App Check / Firebase MUST NOT run eagerly on startup before Google OAuth + GCP discovery
         enableEdgeToEdge()
         setContent {
             AntiGravityTheme {
@@ -77,9 +77,11 @@ fun AppNavigation(auth: FirebaseAuth? = null) {
     val navController = rememberNavController()
     var bootstrapRevision by remember { mutableIntStateOf(0) }
 
+    val oauthSession by InMemoryOAuthSessionStore.sessionFlow.collectAsStateWithLifecycle()
+
+    // Inspect Firebase only if already initialized on-device; never require it at boot
     val resolvedAuth = remember(auth, context, bootstrapRevision) {
         auth ?: runCatching {
-            RuntimeCloudBootstrapStore.ensureFirebaseInitialized(context)
             if (FirebaseApp.getApps(context).isNotEmpty()) Firebase.auth else null
         }.getOrNull()
     }
@@ -87,10 +89,20 @@ fun AppNavigation(auth: FirebaseAuth? = null) {
     val currentUserFlow = remember(resolvedAuth) {
         resolvedAuth?.authStateFlow() ?: flowOf(null)
     }
-    val user by currentUserFlow.collectAsStateWithLifecycle(initialValue = resolvedAuth?.currentUser)
+    val firebaseUser by currentUserFlow.collectAsStateWithLifecycle(initialValue = resolvedAuth?.currentUser)
 
-    val activeUser = user
-    val isAuthenticated = activeUser != null && resolvedAuth != null
+    // Primary session gate: GoogleAccountSession (immutable sub + virtualAlias + OAuth token)
+    val effectiveSession: GoogleAccountSession? = remember(oauthSession, firebaseUser) {
+        oauthSession ?: firebaseUser?.let { fbUser ->
+            GoogleAccountSession.create(
+                sub = fbUser.uid,
+                accessToken = InMemoryOAuthSessionStore.accessToken,
+                email = fbUser.email.orEmpty()
+            )
+        }
+    }
+
+    val isAuthenticated = effectiveSession != null
     val initialDestination = remember {
         if (isAuthenticated) ROUTE_MAIN_HUB else ROUTE_LOGIN
     }
@@ -134,36 +146,58 @@ fun AppNavigation(auth: FirebaseAuth? = null) {
         }
 
         composable(ROUTE_MAIN_HUB) {
-            val signedInUser = activeUser
-            val firebaseAuth = resolvedAuth
-            if (signedInUser != null && firebaseAuth != null) {
-                val uid = signedInUser.uid
-                val email = signedInUser.email.orEmpty()
-                key(uid) {
+            val session = effectiveSession
+            if (session != null) {
+                val sub = session.sub
+                val accountDisplay = session.virtualAlias
+                val optionalFirebaseRepo = remember(sub, resolvedAuth, firebaseUser, bootstrapRevision) {
+                    val activeAuth = resolvedAuth
+                    val activeFbUser = firebaseUser
+                    if (activeAuth != null && activeFbUser != null && FirebaseApp.getApps(context).isNotEmpty()) {
+                        runCatching {
+                            val databaseId = RuntimeCloudBootstrapStore.resolveDatabaseId(context)
+                            val db = FirebaseFirestore.getInstance(databaseId)
+                            FirestoreRepository(db, activeAuth)
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
+                }
+
+                key(sub) {
                     val hubViewModel: HubViewModel = viewModel(
-                        key = uid,
+                        key = sub,
                         factory = viewModelFactory {
                             initializer {
                                 val app = checkNotNull(this[APPLICATION_KEY]) {
                                     "APPLICATION_KEY missing from CreationExtras"
                                 }
-                                val databaseId = RuntimeCloudBootstrapStore.resolveDatabaseId(app)
-                                val db = FirebaseFirestore.getInstance(databaseId)
                                 HubViewModel(
                                     appContext = app,
-                                    repository = FirestoreRepository(db, firebaseAuth),
+                                    repository = optionalFirebaseRepo,
                                     secretsStore = LocalSecretsStore(app),
                                     syncSnapshotStore = SyncSnapshotStore(app),
                                     bridgeClient = CloudBridgeClient(),
-                                    currentUserId = uid,
-                                    userEmail = email
+                                    currentUserId = sub,
+                                    userEmail = accountDisplay,
+                                    onFirebaseProvisioned = {
+                                        configureAppCheck(app, context.findHostActivity()?.intent)
+                                        bootstrapRevision++
+                                    }
                                 )
                             }
                         }
                     )
+
+                    LaunchedEffect(optionalFirebaseRepo) {
+                        if (optionalFirebaseRepo != null) {
+                            hubViewModel.attachCloudRepository(optionalFirebaseRepo)
+                        }
+                    }
+
                     MainHubScreen(
                         viewModel = hubViewModel,
-                        userEmail = email
+                        userEmail = accountDisplay
                     )
                 }
             }

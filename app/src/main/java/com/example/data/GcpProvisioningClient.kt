@@ -13,11 +13,39 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
+data class GcpOrganizationSummary(
+    val name: String,
+    val displayName: String,
+    val directoryCustomerId: String = ""
+) {
+    val orgId: String
+        get() = name.substringAfterLast("/").trim()
+}
+
 data class GcpProjectSummary(
     val projectId: String,
     val name: String,
     val projectNumber: String,
-    val lifecycleState: String
+    val lifecycleState: String,
+    val parentType: String = "",
+    val parentId: String = ""
+)
+
+data class GeminiModelSummary(
+    val modelId: String,
+    val displayName: String,
+    val description: String = "",
+    val supportedMethods: List<String> = emptyList(),
+    val inputTokenLimit: Int = 0
+)
+
+data class AccountDiscoveryResult(
+    val userInfo: GoogleUserInfo?,
+    val organizations: List<GcpOrganizationSummary>,
+    val projects: List<GcpProjectSummary>,
+    val billingAccounts: List<GcpBillingAccountSummary>,
+    val geminiModels: List<GeminiModelSummary>,
+    val discoveryNote: String = ""
 )
 
 data class GcpBillingAccountSummary(
@@ -58,7 +86,8 @@ class GcpProvisioningClient(
     private val serviceUsageBaseUrl: String = "https://serviceusage.googleapis.com",
     private val firebaseMgmtBaseUrl: String = "https://firebase.googleapis.com",
     private val billingBaseUrl: String = "https://cloudbilling.googleapis.com",
-    private val userInfoBaseUrl: String = "https://www.googleapis.com"
+    private val userInfoBaseUrl: String = "https://www.googleapis.com",
+    private val generativeLanguageBaseUrl: String = "https://generativelanguage.googleapis.com"
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
     private val cleanRmBase = resourceManagerBaseUrl.trimEnd('/')
@@ -66,6 +95,7 @@ class GcpProvisioningClient(
     private val cleanFbBase = firebaseMgmtBaseUrl.trimEnd('/')
     private val cleanBillBase = billingBaseUrl.trimEnd('/')
     private val cleanUserInfoBase = userInfoBaseUrl.trimEnd('/')
+    private val cleanGenAiBase = generativeLanguageBaseUrl.trimEnd('/')
 
     suspend fun fetchGoogleUserInfo(accessToken: String): Result<GoogleUserInfo> =
         withContext(Dispatchers.IO) {
@@ -91,6 +121,36 @@ class GcpProvisioningClient(
             }
         }
 
+    suspend fun listOrganizations(accessToken: String): Result<List<GcpOrganizationSummary>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                require(accessToken.isNotBlank()) { "GCP OAuth Access Token が未取得です" }
+                val req = Request.Builder()
+                    .url("$cleanRmBase/v1/organizations:search")
+                    .header("Authorization", "Bearer ${accessToken.trim()}")
+                    .post("{}".toRequestBody(jsonMediaType))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException(parseGoogleApiError(raw, resp.code, "GCP 組織一覧取得"))
+                    }
+                    val arr = JSONObject(raw).optJSONArray("organizations") ?: JSONArray()
+                    (0 until arr.length()).mapNotNull { idx ->
+                        val item = arr.optJSONObject(idx) ?: return@mapNotNull null
+                        val name = item.optString("name", "").trim()
+                        if (name.isBlank()) return@mapNotNull null
+                        val ownerCustomer = item.optJSONObject("owner")?.optString("directoryCustomerId", "").orEmpty()
+                        GcpOrganizationSummary(
+                            name = name,
+                            displayName = item.optString("displayName", name).ifBlank { name },
+                            directoryCustomerId = ownerCustomer
+                        )
+                    }.sortedBy { it.displayName.lowercase() }
+                }
+            }
+        }
+
     suspend fun listProjects(accessToken: String): Result<List<GcpProjectSummary>> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -112,16 +172,110 @@ class GcpProvisioningClient(
                         val item = arr.optJSONObject(idx) ?: return@mapNotNull null
                         val id = item.optString("projectId", "").trim()
                         if (id.isBlank()) return@mapNotNull null
+                        val parent = item.optJSONObject("parent")
                         GcpProjectSummary(
                             projectId = id,
                             name = item.optString("name", id).ifBlank { id },
                             projectNumber = item.optString("projectNumber", ""),
-                            lifecycleState = item.optString("lifecycleState", "ACTIVE")
+                            lifecycleState = item.optString("lifecycleState", "ACTIVE"),
+                            parentType = parent?.optString("type", "").orEmpty(),
+                            parentId = parent?.optString("id", "").orEmpty()
                         )
                     }.sortedBy { it.projectId }
                 }
             }
         }
+
+    suspend fun listAvailableGeminiModels(
+        accessToken: String,
+        projectId: String = "",
+        apiKey: String = ""
+    ): Result<List<GeminiModelSummary>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanToken = accessToken.trim()
+            val cleanApiKey = apiKey.trim()
+            require(cleanToken.isNotBlank() || cleanApiKey.isNotBlank()) {
+                "Gemini モデル検出には OAuth トークンまたは API Key が必要です"
+            }
+            val query = buildString {
+                append("pageSize=50")
+                if (cleanApiKey.isNotBlank()) {
+                    append("&key=").append(URLEncoder.encode(cleanApiKey, "UTF-8"))
+                }
+            }
+            val builder = Request.Builder()
+                .url("$cleanGenAiBase/v1beta/models?$query")
+                .get()
+            if (cleanToken.isNotBlank()) {
+                builder.header("Authorization", "Bearer $cleanToken")
+            }
+            if (projectId.isNotBlank()) {
+                builder.header("X-Goog-User-Project", projectId.trim())
+            }
+            client.newCall(builder.build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException(parseGoogleApiError(raw, resp.code, "Gemini モデル検出"))
+                }
+                val arr = JSONObject(raw).optJSONArray("models") ?: JSONArray()
+                (0 until arr.length()).mapNotNull { idx ->
+                    val item = arr.optJSONObject(idx) ?: return@mapNotNull null
+                    val rawName = item.optString("name", "").trim()
+                    val modelId = rawName.removePrefix("models/").trim()
+                    if (!modelId.contains("gemini", ignoreCase = true)) return@mapNotNull null
+                    val methodsArr = item.optJSONArray("supportedGenerationMethods") ?: JSONArray()
+                    val methods = (0 until methodsArr.length()).mapNotNull { mIdx ->
+                        methodsArr.optString(mIdx, "").trim().takeIf { it.isNotBlank() }
+                    }
+                    GeminiModelSummary(
+                        modelId = modelId,
+                        displayName = item.optString("displayName", modelId).ifBlank { modelId },
+                        description = item.optString("description", "").take(160),
+                        supportedMethods = methods,
+                        inputTokenLimit = item.optInt("inputTokenLimit", 0)
+                    )
+                }.sortedByDescending { it.modelId.contains("flash", ignoreCase = true) || it.modelId.contains("3.") }
+            }
+        }
+    }
+
+    suspend fun discoverAccountResources(
+        accessToken: String,
+        preferredProjectId: String = "",
+        apiKey: String = ""
+    ): Result<AccountDiscoveryResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanToken = accessToken.trim()
+            require(cleanToken.isNotBlank()) { "GCP OAuth Access Token が未取得です" }
+
+            val userInfo = fetchGoogleUserInfo(cleanToken).getOrNull()
+            val projectsRes = listProjects(cleanToken)
+            val projects = projectsRes.getOrElse { throw it }
+            val orgs = listOrganizations(cleanToken).getOrDefault(emptyList())
+            val billing = listBillingAccounts(cleanToken).getOrDefault(emptyList())
+            val effectiveProject = preferredProjectId.trim().ifBlank {
+                projects.firstOrNull()?.projectId.orEmpty()
+            }
+            val models = listAvailableGeminiModels(cleanToken, effectiveProject, apiKey)
+                .getOrDefault(emptyList())
+
+            val summaryParts = buildList {
+                add("Org ${orgs.size}件")
+                add("GCP Project ${projects.size}件")
+                add("請求 ${billing.size}件")
+                add("Gemini ${models.size}モデル")
+            }
+
+            AccountDiscoveryResult(
+                userInfo = userInfo,
+                organizations = orgs,
+                projects = projects,
+                billingAccounts = billing,
+                geminiModels = models,
+                discoveryNote = summaryParts.joinToString(" • ")
+            )
+        }
+    }
 
     suspend fun createProject(
         accessToken: String,
@@ -631,6 +785,18 @@ class GcpProvisioningClient(
                 title = "Firebase App Check API",
                 description = "API 不正利用・Gemini AI Logic 保護",
                 requiredForFreeTier = true
+            ),
+            GcpApiServiceItem(
+                serviceName = "firebasevertexai.googleapis.com",
+                title = "Firebase AI Logic API",
+                description = "Firebase 経由の Gemini 推論実行",
+                requiredForFreeTier = true
+            ),
+            GcpApiServiceItem(
+                serviceName = "generativelanguage.googleapis.com",
+                title = "Generative Language API (AI Studio)",
+                description = "利用可能 Gemini モデル自動検出・推論",
+                requiredForFreeTier = false
             ),
             GcpApiServiceItem(
                 serviceName = "identitytoolkit.googleapis.com",

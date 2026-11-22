@@ -42,7 +42,7 @@ data class AgentBlueprint(
 data class CostConfig(
     @DocumentId val id: String = "",
     val userId: String = "",
-    val alertEmail: String = "17crown2223@gmail.com",
+    val alertEmail: String = "",
     val dailyThresholdUsd: Double = 0.10,
     val autoEmailEnabled: Boolean = true,
     val webhookPath: String = "/v1/cost-alert",
@@ -72,7 +72,7 @@ data class CostAlert(
     val dateKey: String = "",
     val totalUsd: Double = 0.0,
     val thresholdUsd: Double = 0.10,
-    val recipientEmail: String = "17crown2223@gmail.com",
+    val recipientEmail: String = "",
     val deliveryStatus: String = "QUEUED_LOCAL",
     val deliveryDetail: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null,
@@ -121,6 +121,14 @@ data class AttachedSource(
     val kind: SourceAttachmentKind
 )
 
+data class McpEndpointEntry(
+    val id: String,
+    val label: String,
+    val url: String,
+    val bearerToken: String = "",
+    val isActive: Boolean = false
+)
+
 data class ExternalCredentials(
     val gc2223Endpoint: String = "https://gc2223.com",
     val gc2223BearerToken: String = "",
@@ -129,11 +137,22 @@ data class ExternalCredentials(
     val githubPat: String = "",
     val githubOwnerRepo: String = "",
     val githubWorkflowFile: String = "antigravity-deploy.yml",
-    val gcpProjectId: String = "gen-lang-client-0439741065",
+    val githubOAuthClientId: String = "",
+    val githubAccountLogin: String = "",
+    val githubSelectedOrg: String = "",
+    val gcpProjectId: String = "",
     val gcpApiKeyOrToken: String = "",
     val gcpBillingAccountId: String = "",
     val termuxAgentUrl: String = "http://127.0.0.1:8787",
-    val termuxAgentToken: String = ""
+    val termuxAgentToken: String = "",
+    val mcpEndpoints: List<McpEndpointEntry> = listOf(
+        McpEndpointEntry(
+            id = "default_gc2223",
+            label = "gc2223.com Stateless MCP",
+            url = "https://gc2223.com",
+            isActive = true
+        )
+    )
 )
 
 data class VaultMetadata(
